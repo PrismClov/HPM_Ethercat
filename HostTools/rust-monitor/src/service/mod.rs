@@ -6,6 +6,36 @@ use std::{env, path::PathBuf, process::Command, thread, time::Duration};
 
 pub type Result<T> = std::result::Result<T, String>;
 
+pub struct Adapter {
+    pub name: String,
+    pub description: String,
+}
+
+pub fn soem_adapters() -> Result<Vec<Adapter>> {
+    let mut wire = process::Wire::open(helper(Backend::Soem)?.arg("--list-adapters"))?;
+    let mut adapters: Vec<Adapter> = Vec::new();
+    wire.response(|row| {
+        let ["adapter", name, description] = row else {
+            return Err("SOEM 返回了无法识别的网卡数据。".into());
+        };
+        let name = crate::backend::decode_name(name)?;
+        if !name.is_empty() && !adapters.iter().any(|adapter| adapter.name == name) {
+            adapters.push(Adapter {
+                name,
+                description: crate::backend::decode_name(description)?,
+            });
+        }
+        Ok(())
+    })?;
+    wire.finish()?;
+    adapters.sort_by(|left, right| {
+        left.description
+            .cmp(&right.description)
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(adapters)
+}
+
 pub fn cli() {
     if let Err(error) = run() {
         eprintln!("{error}");

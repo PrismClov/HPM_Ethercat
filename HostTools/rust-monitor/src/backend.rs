@@ -31,8 +31,7 @@ impl Backend {
         match self {
             Self::Demo => "",
             Self::Igh => "0",
-            Self::Soem if cfg!(windows) => r"\Device\NPF_{GUID}",
-            Self::Soem => "eth1",
+            Self::Soem => "",
         }
     }
 
@@ -450,15 +449,15 @@ fn protocol_word(value: &str) -> Result<Option<u16>, String> {
     }
 }
 
-fn decode_name(value: &str) -> Result<String, String> {
+pub(crate) fn decode_name(value: &str) -> Result<String, String> {
     if !value.is_ascii() || value.len() % 2 != 0 {
-        return Err("无效的从站名称字段".into());
+        return Err("无效的后端名称字段".into());
     }
     let bytes = (0..value.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "无效的从站名称编码")?;
+        .map_err(|_| "无效的后端名称编码")?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 

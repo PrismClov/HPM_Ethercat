@@ -118,6 +118,7 @@ type EsiStatus = (String, bool, bool);
 
 pub(super) struct Advanced {
     backend: Backend,
+    adapters: crate::adapter_picker::AdapterPicker,
     target: String,
     confirmed: bool,
     writes: bool,
@@ -148,6 +149,7 @@ impl Default for Advanced {
     fn default() -> Self {
         Self {
             backend: Backend::Demo,
+            adapters: crate::adapter_picker::AdapterPicker::default(),
             target: String::new(),
             confirmed: false,
             writes: false,
@@ -352,6 +354,9 @@ impl Advanced {
                     });
                 if self.backend != old {
                     self.target = self.backend.default_target().into();
+                    if self.backend == Backend::Soem {
+                        self.adapters.refresh(ui.ctx());
+                    }
                     self.confirmed = false;
                     self.writes = false;
                     self.slaves.clear();
@@ -360,22 +365,21 @@ impl Advanced {
                     self.write_id = None;
                     self.notice = None;
                 }
-                if self.backend != Backend::Demo {
-                    ui.label(if self.backend == Backend::Igh {
-                        "主站编号"
-                    } else {
-                        "网卡"
-                    });
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.target).desired_width(182.0))
-                        .changed()
-                    {
-                        self.confirmed = false;
-                        self.slaves.clear();
-                        self.selected = None;
-                        self.entries.clear();
-                        self.write_id = None;
+                let changed = match self.backend {
+                    Backend::Igh => {
+                        ui.label("主站编号");
+                        ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(52.0))
+                            .changed()
                     }
+                    Backend::Soem => self.adapters.show(ui, &mut self.target),
+                    Backend::Demo => false,
+                };
+                if changed {
+                    self.confirmed = false;
+                    self.slaves.clear();
+                    self.selected = None;
+                    self.entries.clear();
+                    self.write_id = None;
                 }
             });
             ui.add_enabled_ui(

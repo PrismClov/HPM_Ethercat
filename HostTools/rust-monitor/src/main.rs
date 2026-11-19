@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod adapter_picker;
 mod advanced;
 mod pdo;
 mod workbench;
@@ -27,6 +28,7 @@ struct Monitor {
     selected_slave: Option<u32>,
     show_advanced: bool,
     advanced: advanced::Advanced,
+    adapters: adapter_picker::AdapterPicker,
 }
 
 impl Default for Monitor {
@@ -46,6 +48,7 @@ impl Default for Monitor {
             selected_slave: None,
             show_advanced: true,
             advanced: advanced::Advanced::default(),
+            adapters: adapter_picker::AdapterPicker::default(),
         }
     }
 }
@@ -89,6 +92,9 @@ impl Monitor {
                     });
                 if self.backend != previous {
                     self.target = self.backend.default_target().into();
+                    if self.backend == Backend::Soem {
+                        self.adapters.refresh(ui.ctx());
+                    }
                     self.pdo_enabled = self.backend == Backend::Demo;
                     self.bus_confirmed = false;
                     self.error = None;
@@ -107,11 +113,7 @@ impl Monitor {
                         }
                     }
                     Backend::Soem => {
-                        ui.label("网卡");
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut self.target).desired_width(245.0))
-                            .changed()
-                        {
+                        if self.adapters.show(ui, &mut self.target) {
                             self.bus_confirmed = false;
                         }
                     }

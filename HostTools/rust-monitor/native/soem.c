@@ -164,6 +164,23 @@ stop:
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--list-adapters") == 0)
+    {
+        ec_adaptert *adapters = ec_find_adapters();
+        for (const ec_adaptert *adapter = adapters; adapter; adapter = adapter->next)
+        {
+            if (!adapter->name[0])
+                continue;
+            fputs("ecat\tadapter\t", stdout);
+            hex_field(adapter->name, sizeof(adapter->name));
+            putchar('\t');
+            hex_field(adapter->desc, sizeof(adapter->desc));
+            putchar('\n');
+        }
+        ec_free_adapters(adapters);
+        end_snapshot();
+        return 0;
+    }
     static ecx_contextt context;
     int echo = argc == 3 && strcmp(argv[2], "--pdo-echo") == 0;
     int pdo = echo || (argc == 3 && strcmp(argv[2], "--pdo") == 0);
