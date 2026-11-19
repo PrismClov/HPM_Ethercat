@@ -1,6 +1,6 @@
-set -o pipefail
-app=/root/hpm-ethercat/build/ecat_soem_master
-base=/mnt/c/Users/Administrator/Documents/ChatGPT/hpm/ecat-ram
+set -euo pipefail
+base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+app="${HPM_SOEM_BUILD:-/root/hpm-ethercat/build}/ecat_soem_master"
 python3 "$base/wsl_ethercat_relay.py" &
 relay=$!
 trap 'kill "$relay" 2>/dev/null || true' EXIT

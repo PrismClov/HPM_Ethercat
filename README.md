@@ -2,9 +2,12 @@
 
 这个仓库保存 IPB-TINY 板卡的 P0 测点图、PHY 诊断和 PDO 测试脚本，以及实时性测试所用的固件和 Linux 主站补丁。Flash 备份、下载的工具链和编译产物保留在本机，Git 忽略这些文件。
 
+- [EtherCAT 上位机](HostTools/README.md)
 - [P0 测点图](p0-probe-points.svg)
 - [RAM PHY 诊断](ecat-ram/phy_diag.c)
 - [Windows 发帧结果](ecat-ram/hpm_p0_timing.csv)
+
+`HostTools/` 导入了 MC02 上位机的 `141bfed` 版本，并合入 HPM PDO 解码和 DC 启动适配。WSL 构建脚本直接使用仓库内的 C 版主站源码。
 
 ## 源码基线
 
