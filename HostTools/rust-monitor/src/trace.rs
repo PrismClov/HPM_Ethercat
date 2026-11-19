@@ -108,7 +108,14 @@ impl Watch {
     pub fn formatted(&self, frame: &Recorded) -> Option<String> {
         let value = self.value(frame)?;
         Some(match self.display {
-            Display::Hex => format!("0x{value:X}"),
+            Display::Hex => {
+                let width = match self.key.source {
+                    Source::Wkc => 1,
+                    Source::Gpio | Source::Pdi => 4,
+                    Source::Pdo => self.key.width.min(64).div_ceil(4),
+                };
+                format!("0x{value:0width$X}", width = usize::from(width))
+            }
             Display::Decimal => value.to_string(),
             Display::Bits => {
                 let width = if matches!(self.key.source, Source::Gpio | Source::Pdi) {

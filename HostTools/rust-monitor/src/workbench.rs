@@ -59,8 +59,8 @@ impl Default for Profile {
             dc: false,
             activation: "0x0300".into(),
             watches: Vec::new(),
-            left: 0.19,
-            right: 0.22,
+            left: 0.16,
+            right: 0.24,
             bottom: 0.40,
         }
     }
