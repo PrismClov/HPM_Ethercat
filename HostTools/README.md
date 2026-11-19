@@ -2,7 +2,7 @@
 
 PC 侧主站（C + SOEM 2.0.0）与实时控制界面（Python + PySide6 + pyqtgraph）。
 
-另见 [Rust EtherCAT 总线监测器](rust-monitor/README.md)，支持 IgH 和 SOEM 2.0.0。
+另见 [Rust EtherCAT 总线监测器](rust-monitor/README.md) 和 [HPM5E31 从站固件](../firmware/hpm5e31/README.md)。
 
 本目录是固件仓库的 `HostTools/`，和从站固件（`User/`、`Core/`）在同一个 git 仓库里。
 

@@ -1,3 +1,4 @@
+import argparse
 import csv
 import math
 import time
@@ -5,6 +6,11 @@ from collections import Counter
 from pathlib import Path
 
 import pysoem
+
+repo_root = Path(__file__).resolve().parents[2]
+parser = argparse.ArgumentParser(description="Measure Windows SOEM cycle timing.")
+parser.add_argument("--output", type=Path, default=repo_root / "build/hpm5e31-lab/hpm_p0_timing.csv")
+args = parser.parse_args()
 
 clock = time.perf_counter_ns
 adapter = r"\Device\NPF_{9269FBF0-8A17-4A3B-A238-90DF8FACBB09}"
@@ -45,7 +51,8 @@ try:
     if slave.state != pysoem.OP_STATE:
         raise RuntimeError(f"OP not reached: state={slave.state:#x} AL={slave.al_status:#x}")
     expected = master.expected_wkc
-    with Path(__file__).with_name("hpm_p0_timing.csv").open("w", newline="") as f:
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", newline="") as f:
         fields = ["period_us", "duration_s", "frames", "expected_wkc", "bad_wkc", "skipped_slots", "interval_p50_us", "interval_p99_us", "interval_max_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us", "state", "al_status", "wkc_histogram"]
         writer = csv.DictWriter(f, fields)
         writer.writeheader()

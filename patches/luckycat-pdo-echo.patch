@@ -1,0 +1,61 @@
+--- a/demo/4_ethercat_io/ecat_io/application/digital_io.c
++++ b/demo/4_ethercat_io/ecat_io/application/digital_io.c
+@@ -33,15 +33,9 @@
+ #include "hpm_gpio_drv.h"
+ 
+ 
+-static uint32_t output_map_cycle;
+-static bool output_map_valid;
+-
+-static inline uint32_t pdi_cycle_count(void)
+-{
+-    uint32_t cycles;
+-    __asm volatile ("csrr %0, mcycle" : "=r"(cycles) :: "memory");
+-    return cycles;
+-}
++/* Pinned to the host IgH echo benchmark's wire format. */
++#define HPM_ECHO_IDLE 0xeca74ca0u
++#define HPM_ECHO_MASK 0x3fffffffu
+ 
+ UINT32 APPL_GetDipSw(void);
+ void APPL_SetLed(UINT32 value);
+@@ -268,17 +262,9 @@
+ */
+ void APPL_InputMapping(UINT16 *pData)
+ {
+-    const uint32_t now = pdi_cycle_count();
+-    uint32_t phase_us = 0xffffu;
+-    if (output_map_valid) {
+-        uint32_t elapsed_us = (now - output_map_cycle) / (BOARD_CPU_FREQ / 1000000u);
+-        if (elapsed_us < 0xffffu) {
+-            phase_us = elapsed_us;
+-        }
+-    }
+-
+-    /* Keep GPIO inputs in the low half; report PDI phase in the high half. */
+-    uint32_t input_pdo = (InputCounter0x6000 & 0xffffu) | (phase_us << 16);
++    const uint32_t token = (uint32_t)OutputCounter0x7010;
++    const uint32_t echo = token && token <= HPM_ECHO_MASK ? token << 2 : HPM_ECHO_IDLE;
++    uint32_t input_pdo = echo | (InputCounter0x6000 & 3u);
+     MEMCPY(pData, &input_pdo, SIZEOF(input_pdo));
+ }
+ 
+@@ -291,8 +277,6 @@
+ void APPL_OutputMapping(UINT16 *pData)
+ {
+     MEMCPY(&OutputCounter0x7010, pData, SIZEOF(OutputCounter0x7010));
+-    output_map_cycle = pdi_cycle_count();
+-    output_map_valid = true;
+ }
+ 
+ /**
+@@ -302,7 +286,8 @@
+ void APPL_Application(void)
+ {
+     InputCounter0x6000 = APPL_GetDipSw();
+-    APPL_SetLed((UINT32)OutputCounter0x7010);
++    /* Diagnostic tokens must never exercise GPIO output or OLED I/O. */
++    APPL_SetLed(0);
+ }
+ 
+ #if EXPLICIT_DEVICE_ID

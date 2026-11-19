@@ -43,7 +43,7 @@ static int wait_for_preop(ec_master_t *master, ec_slave_info_t *slave)
     return 0;
 }
 
-static int run_pdo(ec_master_t *master)
+static int run_pdo(ec_master_t *master, int echo)
 {
     ec_master_info_t info = {0};
     for (unsigned attempt = 0; attempt < 30; ++attempt)
@@ -122,9 +122,12 @@ static int run_pdo(ec_master_t *master)
     }
 
     int error_flag = 0;
+    uint32_t token = 0;
+    uint64_t first_valid_ns = 0;
     for (int request = 'S'; request; request = next_request())
     {
         ecrt_master_receive(master);
+        uint64_t rx_ns = echo ? monotonic_ns() : 0;
         ecrt_domain_process(domain);
         ec_domain_state_t domain_state = {0};
         ec_slave_config_state_t state = {0};
@@ -149,13 +152,43 @@ static int run_pdo(ec_master_t *master)
         if (state.online)
             slave_row(0, slave.vendor_id, slave.product_code, slave.revision_number,
                       state.al_state | (error_flag ? 0x10 : 0), -1, slave.name, sizeof(slave.name));
-        pdo_row(state.operational && !error_flag && domain_state.wc_state == EC_WC_COMPLETE,
-                (int)domain_state.working_counter, -1, data + input);
+        int valid = state.operational && !error_flag && domain_state.wc_state == EC_WC_COMPLETE;
+        pdo_row(valid, (int)domain_state.working_counter, -1, data + input);
+
+        if (echo && !token && valid)
+        {
+            if ((hpm_u32(data + input) & ~3u) == HPM_ECHO_IDLE)
+                token = 1;
+            else
+            {
+                if (!first_valid_ns)
+                    first_valid_ns = rx_ns;
+                if (rx_ns - first_valid_ns >= UINT64_C(250000000))
+                {
+                    pdo_error("HPM echo firmware signature missing. Only zero outputs were sent.");
+                    return 1;
+                }
+            }
+        }
+        else if (echo && token)
+            ++token;
 
         memset(data + output, 0, HPM_PDO_BYTES);
+        if (token)
+            EC_WRITE_U32(data + output, token);
+        ecrt_domain_queue(domain);
+        uint64_t tx_ns = echo ? monotonic_ns() : 0;
+        ecrt_master_send(master);
+        if (echo)
+            echo_row(token, tx_ns, rx_ns);
+        end_snapshot();
+    }
+    if (echo && token)
+    {
+        memset(data + output, 0, HPM_PDO_BYTES);
+        ecrt_master_receive(master);
         ecrt_domain_queue(domain);
         ecrt_master_send(master);
-        end_snapshot();
     }
     return 0;
 }
@@ -163,8 +196,9 @@ static int run_pdo(ec_master_t *master)
 int main(int argc, char **argv)
 {
     char *end;
+    int echo = argc == 3 && strcmp(argv[2], "--pdo-echo") == 0;
     if ((argc != 2 && argc != 3) || argv[1][0] < '0' || argv[1][0] > '9' ||
-        (argc == 3 && strcmp(argv[2], "--pdo") != 0))
+        (argc == 3 && !echo && strcmp(argv[2], "--pdo") != 0))
         return 2;
     errno = 0;
     unsigned long index = strtoul(argv[1], &end, 10);
@@ -180,7 +214,7 @@ int main(int argc, char **argv)
 
     if (argc == 3)
     {
-        int result = next_request() ? run_pdo(master) : 0;
+        int result = next_request() ? run_pdo(master, echo) : 0;
         ecrt_release_master(master);
         return result;
     }

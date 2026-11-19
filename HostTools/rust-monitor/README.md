@@ -23,7 +23,7 @@ SOEM 扫描会将从站切到 INIT，并重置部分 ESC 配置和分配站地�
 
 曲线显示最近 10 秒。无有效 PDO 的周期在两张图上留空，`0xffff` 仅使相位曲线留空。SOEM 显示实际和期望 WKC，IgH 使用 PDO 域的完整性状态决定样本是否有效。断开后界面保留上一次记录。正常断开时，SOEM 请求 SAFE-OP，IgH 释放主站和域。
 
-目标采集周期为 100–20000 µs，默认 5000 µs。采集使用固定周期，跳过已错过的时隙。2000 µs 及更短周期使用忙等减少唤醒抖动，会占用 CPU。实际周期受操作系统调度和报文往返影响，曲线按软件收到样本的单调时钟绘制。此版本使用非 DC 采集。当前机型适配针对单台板卡和 [仓库固件补丁](../../patches/luckycat-p0-diagnostics.patch)，其他固件即使 PDO 大小相同也可能采用不同的高 16 位语义。
+目标采集周期为 100–20000 µs，默认 5000 µs。采集使用固定周期，跳过已错过的时隙。2000 µs 及更短周期使用忙等减少唤醒抖动，会占用 CPU。实际周期受操作系统调度和报文往返影响，曲线按软件收到样本的单调时钟绘制。此版本使用非 DC 采集。当前机型适配针对单台板卡和 [仓库里的 PDI 相位固件](../../firmware/hpm5e31/README.md)，其他固件即使 PDO 大小相同也可能采用不同的高 16 位语义。
 
 ## 频率和丢帧测试
 
@@ -36,12 +36,17 @@ ECAT_MONITOR_BACKEND_DIR="$(realpath build/native)" \
 
 Windows 将 `ECAT_MONITOR_BACKEND_DIR` 指向后端所在目录，把末尾的 `igh 0` 换成 `soem` 和 Npcap 设备名。以微秒填写周期。输出为 CSV，`invalid_pct` 是已完成采样中 PDO 无效的比例，`missed_slots_pct` 是相对目标频率未完成的时隙比例。间隔分位数以 Rust 收到相邻样本的时间差计算。
 
-### 2026-11-19 实机记录
+### 直连 PDO 回读测试
 
-单台 HPM5E31-KIT，FreeRun，RxPDO 固定为零。两种后端均进入 OP。静态 GPIO 为 `0x0000`，与 CoE 单独读取 `0x6000:00` 一致。有效 PDI 相位为 0–1 µs。IgH 通过 WSL2 的 TAP/Npcap 转发链路测试，另用 SOEM 在同一转发链路测试作为对照。Windows 的 SOEM 数据来自专用网卡直连。[实机扫频与复测 CSV](hpm-pdo-live-2026-11-19.csv)
-Windows SOEM 直连的 2 kHz 复测持续 30 秒，P50/P99 为 499/631 µs，PDO 无效率 0.00167%，漏调度 0.32333%。提高到 4 kHz 后，15 秒测得漏调度 1.46333%。IgH 转发的 400 Hz 复测持续 25 秒，P50/P99 为 2499/2626 µs，PDO 无效率 0.18%。同一路径下 IgH 在 1 kHz 和 2 kHz 的 PDO 无效率分别为 1.18414%（25 秒）和 4.25500%（10 秒）。
+先用原有 PDI 相位固件在原生 Linux 和物理直连网口上完成上述扫频。回读使用独立的诊断固件。使用 [HPM 固件工程](../../firmware/hpm5e31/README.md) 的 `HPM_PDO_MODE=echo` 构建并加载诊断固件。诊断固件将输出 PDO 中的测试序号放到输入 PDO 的位 2–31，位 0–1 仍为 GPIO。诊断序号不驱动 LED 或 OLED。优先用 RAM 构建加载诊断固件，测试完成后复位回到原有 PDI 相位固件。
 
-另用 Windows PySOEM 在单进程里绕开 Rust 和后端的管道，5 秒短测峰值约 7.9k 个有效 PDO/s，同时漏掉约 60% 的 20 kHz 目标时隙。这是吞吐探测，实机数据对应单板、固定零值输出、非 DC 的主站收发路径。[单进程探测 CSV](hpm-pdo-direct-probe-2026-11-19.csv)
+```bash
+python3 examples/pdo_echo_bench.py ./build/native/ecat-monitor-igh 0 15 5000 2000 1000 750 500 350 250
+```
+
+IgH 和 SOEM 均在读取到诊断固件签名前保持零输出。SOEM 使用同一脚本，传入 `ecat-monitor-soem` 或 `ecat-monitor-soem.exe` 以及直连网卡名或 Npcap 设备名。延迟从主机提交输出帧前到主机接收匹配序号后计算，包含软件调度和从站回显。`period_error` 是实测接收间隔与目标周期之差的绝对值。CSV 分开报告无效 PDO、错过的目标时隙和发出后未收到对应回显的序号。回读模式衡量诊断环路的频率和时延。
+
+[实机扫频、回读结果及原始 CSV](../../docs/benchmarks/hpm5e31/README.md)。
 
 ## Linux 构建与运行
 
@@ -58,8 +63,8 @@ cmake -S native -B build/native -DCMAKE_BUILD_TYPE=Release \
   -DSOEM_ROOT=/path/to/SOEM-v2.0.0 -DMONITOR_IGH=ON
 cmake --build build/native --parallel
 
-# Linux 原始套接字权限只授予 SOEM 后端可执行文件。
-sudo setcap cap_net_raw+ep "$(realpath build/native/ecat-monitor-soem)"
+# SOEM 需要原始套接字权限和设置网卡混杂模式的权限。
+sudo setcap cap_net_raw,cap_net_admin+ep "$(realpath build/native/ecat-monitor-soem)"
 ECAT_MONITOR_BACKEND_DIR="$(realpath build/native)" ./target/release/ethercat-monitor
 ```
 

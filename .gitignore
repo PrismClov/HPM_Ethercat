@@ -7,6 +7,7 @@
 /ecat-ram/rv32imac_zicsr_zifencei_multilib_b_ext-win/
 
 # Local build output, firmware backups and installer packages
+/build/
 /ecat-ram/build/
 /ecat-ram/flash-build/
 /ecat-ram/zbuild/

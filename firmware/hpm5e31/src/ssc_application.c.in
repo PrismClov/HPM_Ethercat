@@ -1,0 +1,6 @@
+/* Keep the generated dictionary and SSC callbacks in the local dependency.
+ * The in-tree application supplies only the three process-data hooks. */
+#define APPL_InputMapping  ssc_sample_input_mapping
+#define APPL_OutputMapping ssc_sample_output_mapping
+#define APPL_Application   ssc_sample_application
+#include "@ssc_application@"

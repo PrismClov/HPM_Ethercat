@@ -2,12 +2,41 @@
 #define MONITOR_HPM_PDO_H
 
 #include "protocol.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 #define HPM_VENDOR 0x00024121u
 #define HPM_PRODUCT 0x00000001u
 #define HPM_OUTPUT 0x7010
 #define HPM_INPUT 0x6000
 #define HPM_PDO_BYTES 4
+#define HPM_ECHO_IDLE 0xeca74ca0u
+
+static inline uint64_t monotonic_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER now;
+    if (!frequency.QuadPart)
+        QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    uint64_t ticks = (uint64_t)now.QuadPart, hz = (uint64_t)frequency.QuadPart;
+    return (ticks / hz) * UINT64_C(1000000000) + (ticks % hz) * UINT64_C(1000000000) / hz;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+#endif
+}
+
+static inline void echo_row(uint32_t token, uint64_t tx_ns, uint64_t rx_ns)
+{
+    printf("ecat\techo\t%" PRIu32 "\t%" PRIu64 "\t%" PRIu64 "\n", token, tx_ns, rx_ns);
+}
 
 typedef size_t (*hpm_read_sdo)(void *master, uint16_t index, uint8_t subindex,
                                uint8_t *bytes, size_t capacity);

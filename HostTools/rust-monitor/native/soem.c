@@ -26,15 +26,18 @@ static size_t read_sdo(void *master, uint16_t index, uint8_t subindex,
            size > 0 && (size_t)size <= capacity ? (size_t)size : 0;
 }
 
-static int exchange(ecx_contextt *context, ec_slavet *slave)
+static int exchange(ecx_contextt *context, ec_slavet *slave, uint32_t token, uint64_t *tx_ns)
 {
-    memset(slave->outputs, 0, HPM_PDO_BYTES);
+    for (unsigned i = 0; i < HPM_PDO_BYTES; ++i)
+        slave->outputs[i] = (uint8_t)(token >> (8u * i));
+    if (tx_ns)
+        *tx_ns = monotonic_ns();
     if (ecx_send_processdata(context) <= 0)
         return EC_NOFRAME;
     return ecx_receive_processdata(context, EC_TIMEOUTRET);
 }
 
-static int run_pdo(ecx_contextt *context, int count)
+static int run_pdo(ecx_contextt *context, int count, int echo)
 {
     ec_slavet *slave = &context->slavelist[1];
     if (count != 1 || slave->eep_man != HPM_VENDOR || slave->eep_id != HPM_PRODUCT)
@@ -72,7 +75,7 @@ static int run_pdo(ecx_contextt *context, int count)
         pdo_error("HPM slave did not reach SAFE-OP.");
         return 1;
     }
-    (void)exchange(context, slave);
+    (void)exchange(context, slave, 0, NULL);
     slave->state = EC_STATE_OPERATIONAL;
     int result = 1;
     if (ecx_writestate(context, 1) <= 0)
@@ -84,7 +87,7 @@ static int run_pdo(ecx_contextt *context, int count)
     int state = -1, code = -1;
     for (unsigned attempt = 0; attempt < 300; ++attempt)
     {
-        (void)exchange(context, slave);
+        (void)exchange(context, slave, 0, NULL);
         if (attempt % 8 == 0)
         {
             read_al(context, slave, &state, &code);
@@ -100,6 +103,8 @@ static int run_pdo(ecx_contextt *context, int count)
     }
 
     int responding = 1;
+    uint32_t next_token = 0;
+    uint64_t first_valid_ns = 0;
     for (int request = 'S'; request; request = next_request())
     {
         if (request == 'S')
@@ -112,18 +117,42 @@ static int run_pdo(ecx_contextt *context, int count)
             }
             read_al(context, slave, &state, &code);
         }
-        int wkc = exchange(context, slave);
+        uint32_t sent = next_token;
+        uint64_t tx_ns = 0;
+        int wkc = exchange(context, slave, sent, echo ? &tx_ns : NULL);
+        uint64_t rx_ns = echo ? monotonic_ns() : 0;
+        int valid = responding && state == EC_STATE_OPERATIONAL && wkc == expected;
+        if (echo && !sent && valid)
+        {
+            if ((hpm_u32(slave->inputs) & ~3u) == HPM_ECHO_IDLE)
+                next_token = 1;
+            else
+            {
+                if (!first_valid_ns)
+                    first_valid_ns = rx_ns;
+                if (rx_ns - first_valid_ns >= UINT64_C(250000000))
+                {
+                    pdo_error("HPM echo firmware signature missing. Only zero outputs were sent.");
+                    goto stop;
+                }
+            }
+        }
+        else if (sent)
+            ++next_token;
         printf("ecat\tsnapshot\t%d\t%s\n", responding, responding ? "responding" : "silent");
         if (responding)
             slave_row(0, slave->eep_man, slave->eep_id, slave->eep_rev,
                       state, code, slave->name, sizeof(slave->name));
-        pdo_row(responding && state == EC_STATE_OPERATIONAL && wkc == expected,
-                wkc, expected, slave->inputs);
+        pdo_row(valid, wkc, expected, slave->inputs);
+        if (echo)
+            echo_row(sent, tx_ns, rx_ns);
         end_snapshot();
     }
     result = 0;
 
 stop:
+    if (echo && next_token)
+        (void)exchange(context, slave, 0, NULL);
     slave->state = EC_STATE_SAFE_OP;
     (void)ecx_writestate(context, 1);
     (void)ecx_statecheck(context, 1, EC_STATE_SAFE_OP, EC_TIMEOUTRET3);
@@ -133,7 +162,8 @@ stop:
 int main(int argc, char **argv)
 {
     static ecx_contextt context;
-    int pdo = argc == 3 && strcmp(argv[2], "--pdo") == 0;
+    int echo = argc == 3 && strcmp(argv[2], "--pdo-echo") == 0;
+    int pdo = echo || (argc == 3 && strcmp(argv[2], "--pdo") == 0);
     if ((argc != 2 && !pdo) || !argv[1][0])
         return 2;
 
@@ -169,7 +199,7 @@ int main(int argc, char **argv)
 
     if (pdo)
     {
-        int result = run_pdo(&context, count);
+        int result = run_pdo(&context, count, echo);
         ecx_close(&context);
         return result;
     }

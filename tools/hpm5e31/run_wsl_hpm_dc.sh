@@ -1,6 +1,8 @@
 set -euo pipefail
 base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-app="${HPM_SOEM_BUILD:-/root/hpm-ethercat/build}/ecat_soem_master"
+app="${HPM_SOEM_BUILD:-${XDG_CACHE_HOME:-$HOME/.cache}/hpm-ethercat/soem-master}/ecat_soem_master"
+log_dir="${HPM_TEST_LOG_DIR:-$base/../../build/hpm5e31-lab}"
+mkdir -p "$log_dir"
 python3 "$base/wsl_ethercat_relay.py" &
 relay=$!
 trap 'kill "$relay" 2>/dev/null || true' EXIT
@@ -12,4 +14,4 @@ python3 "$base/probe_wsl_ethercat.py" || exit 1
 
 
   stdbuf -oL -eL "$app" -i ecat0 -c 500 -t 60 --dc --dc-lead-us 150 --cpu 5 --rt-priority 80 --lock-memory 2>&1 |
-  tee "$base/wsl_hpm_dc_500us_60s.log"
+  tee "$log_dir/wsl_hpm_dc_500us_60s.log"
