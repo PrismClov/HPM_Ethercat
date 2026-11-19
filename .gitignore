@@ -1,0 +1,20 @@
+# Third-party downloads and extracted SDK/toolchain trees
+/hpm-openocd/
+/hpm-openocd.zip
+/ecat-ram/LuckyCAT_SoftWare-main/
+/ecat-ram/orin-master/
+/ecat-ram/pydeps/
+/ecat-ram/rv32imac_zicsr_zifencei_multilib_b_ext-win/
+
+# Local build output, firmware backups and installer packages
+/ecat-ram/build/
+/ecat-ram/flash-build/
+/ecat-ram/zbuild/
+/ecat-ram/edit_mc02_timing.py
+*.bin
+*.elf
+*.zip
+*.tar.gz
+*.msi
+*.log
+__pycache__/

@@ -1,0 +1,66 @@
+--- a/HostTools/soem_master/src/soem_master.c
++++ b/HostTools/soem_master/src/soem_master.c
+@@ -690,9 +690,15 @@
+             }
+         }
+     }
+-    if (group->Ibytes >= IN_PHASE_OFF + 2U)
+-    {
+-        master->phase_us = rd_u16(group->inputs + IN_PHASE_OFF);
++    const ec_slavet *slave = &master->ctx.slavelist[1];
++    const bool hpm_phase_pdo = (master->ctx.slavecount == 1) &&
++                               (slave->eep_man == 0x00024121U) &&
++                               (slave->eep_id == 0x00000001U) &&
++                               (group->Ibytes == 4U);
++    if (hpm_phase_pdo || group->Ibytes >= IN_PHASE_OFF + 2U)
++    {
++        const unsigned phase_offset = hpm_phase_pdo ? 2U : IN_PHASE_OFF;
++        master->phase_us = rd_u16(group->inputs + phase_offset);
+         if (master->phase_us > master->phase_max_us)
+         {
+             master->phase_max_us = master->phase_us;
+@@ -1032,6 +1038,11 @@
+ static bool wait_state_pumped(Master *master, uint16_t state, int timeout_ms)
+ {
+     uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
++    const ec_slavet *slave = &master->ctx.slavelist[1];
++    const bool paced = master->dc_active && master->ctx.slavecount == 1 &&
++                       slave->eep_man == 0x00024121U && slave->eep_id == 1U;
++    uint64_t next_frame = now_ns();
++    uint64_t next_poll = next_frame;
+ 
+     while (now_ns() < deadline)
+     {
+@@ -1040,6 +1051,14 @@
+ 
+         (void)ecx_send_processdata(&master->ctx);
+         (void)ecx_receive_processdata(&master->ctx, EC_TIMEOUTRET);
++        if (paced && now_ns() < next_poll)
++        {
++            next_frame += master->cycle_ns;
++            if (next_frame < now_ns()) next_frame = now_ns();
++            sleep_until_ns(next_frame);
++            continue;
++        }
++        if (paced) next_poll = now_ns() + 20000000ULL;
+         for (slave_index = 1; slave_index <= master->ctx.slavecount; slave_index++)
+         {
+             const uint16_t config_address =
+@@ -1058,7 +1077,16 @@
+         {
+             return true;
+         }
+-        osal_usleep(1000);
++        if (paced)
++        {
++            next_frame += master->cycle_ns;
++            if (next_frame < now_ns()) next_frame = now_ns();
++            sleep_until_ns(next_frame);
++        }
++        else
++        {
++            osal_usleep(1000);
++        }
+     }
+     return false;
+ }

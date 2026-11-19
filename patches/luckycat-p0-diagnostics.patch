@@ -1,0 +1,107 @@
+--- a/demo/4_ethercat_io/ecat_io/ecat.c
++++ b/demo/4_ethercat_io/ecat_io/ecat.c
+@@ -16,9 +16,24 @@
+ #include "hpm_l1c_drv.h"
+ #include "oled.h"
+ 
++volatile uint32_t p0_diagnostic[9] __attribute__((section(".noncacheable.bss")));
++
++static void record_p0_phy(void)
++{
++    static const uint8_t reg[] = {2, 3, 1, 1};
++    const uint8_t phy = BOARD_ECAT_PHY_ADDR_OFFSET + BOARD_ECAT_PORT0_PHY_ADDR;
++    for (unsigned i = 0; i < sizeof(reg); ++i) {
++        uint16_t value = 0;
++        p0_diagnostic[1 + i * 2] = esc_mdio_read(HPM_ESC, phy, reg[i], &value);
++        p0_diagnostic[2 + i * 2] = value;
++    }
++    p0_diagnostic[0] = 0x50485904;
++}
++
+ int main(void)
+ {
+     hpm_stat_t stat;
++    p0_diagnostic[0] = 0x50485901;
+     board_init();
+     board_init_led_pins();
+     OLED_Init();
+@@ -32,12 +47,16 @@
+     printf("EtherCAT IO sample\n");
+ 
+     /* hardware init */
++    p0_diagnostic[0] = 0x50485902;
+     stat = ecat_hardware_init(HPM_ESC);
++    p0_diagnostic[1] = stat;
++    p0_diagnostic[0] = 0x50485903;
+     if (stat != status_success) {
+         printf("Init ESC peripheral and related devices(EEPROM/PHY) failed!\n");
+         return 0;
+     }
+ 
++    record_p0_phy();
+     MainInit(); /* SSC Initilize the stack */
+ 
+ #if defined(ESC_EEPROM_EMULATION) && ESC_EEPROM_EMULATION
+--- a/demo/4_ethercat_io/ecat_io/application/digital_io.c
++++ b/demo/4_ethercat_io/ecat_io/application/digital_io.c
+@@ -32,6 +32,16 @@
+ #include "ecat_config.h"
+ #include "hpm_gpio_drv.h"
+ 
++
++static uint32_t output_map_cycle;
++static bool output_map_valid;
++
++static inline uint32_t pdi_cycle_count(void)
++{
++    uint32_t cycles;
++    __asm volatile ("csrr %0, mcycle" : "=r"(cycles) :: "memory");
++    return cycles;
++}
+ 
+ UINT32 APPL_GetDipSw(void);
+ void APPL_SetLed(UINT32 value);
+@@ -258,7 +268,18 @@
+ */
+ void APPL_InputMapping(UINT16 *pData)
+ {
+-    MEMCPY(pData, &InputCounter0x6000, SIZEOF(InputCounter0x6000));
++    const uint32_t now = pdi_cycle_count();
++    uint32_t phase_us = 0xffffu;
++    if (output_map_valid) {
++        uint32_t elapsed_us = (now - output_map_cycle) / (BOARD_CPU_FREQ / 1000000u);
++        if (elapsed_us < 0xffffu) {
++            phase_us = elapsed_us;
++        }
++    }
++
++    /* Keep GPIO inputs in the low half; report PDI phase in the high half. */
++    uint32_t input_pdo = (InputCounter0x6000 & 0xffffu) | (phase_us << 16);
++    MEMCPY(pData, &input_pdo, SIZEOF(input_pdo));
+ }
+ 
+ /**
+@@ -270,6 +291,8 @@
+ void APPL_OutputMapping(UINT16 *pData)
+ {
+     MEMCPY(&OutputCounter0x7010, pData, SIZEOF(OutputCounter0x7010));
++    output_map_cycle = pdi_cycle_count();
++    output_map_valid = true;
+ }
+ 
+ /**
+@@ -302,8 +325,12 @@
+ void APPL_SetLed(UINT32 value)
+ {
+     UINT8 led0 = ((value > 0) ?  BOARD_LED_ON_LEVEL : BOARD_LED_OFF_LEVEL);
+-    OLED_ShowNum(0, 32, value, 10, 16, 1);
+-    OLED_Refresh();
++    static UINT32 displayed_value;
++    if (value != displayed_value) {
++        OLED_ShowNum(0, 32, value, 10, 16, 1);
++        OLED_Refresh();
++        displayed_value = value;
++    }
+     board_led_write(led0);
+ }
+ 
