@@ -1,0 +1,16 @@
+[package]
+name = "ethercat-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe"]
+
+[[bin]]
+name = "ethercat-monitor"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[dependencies]
+eframe = { version = "0.31.1", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
