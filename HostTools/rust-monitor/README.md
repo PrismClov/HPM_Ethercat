@@ -1,6 +1,6 @@
 # EtherCAT 总线监测器
 
-Rust + egui 桌面程序。可切换 IgH、SOEM 和演示数据源，查看总线响应、从站位置、名称、厂商 ID、产品代码、修订号、AL 状态和错误标志。SOEM 还显示 AL 状态码。状态监测的刷新间隔可设为 100–5000 ms。勾选「HPM PDO」可采集并绘制 HPM5E31-KIT 的输入过程数据。
+Rust + egui 桌面程序。顶部选择主站并连接，左侧选择从站查看身份、AL 状态和已适配的 PDO 变量，中央查看扫描结果或实时波形。状态监测的刷新间隔可设为 100–5000 ms。勾选「PDO 采集」可采集并绘制 HPM5E31-KIT 的输入过程数据。工作流参考 [SimpleCAT](https://github.com/NutHero/SimpleCAT-EtherCAT-MasterV1.0.0)。
 
 | 后端 | 平台 | 连接参数 | 行为 |
 | --- | --- | --- | --- |
@@ -10,18 +10,46 @@ Rust + egui 桌面程序。可切换 IgH、SOEM 和演示数据源，查看总�
 
 SOEM 扫描会将从站切到 INIT，并重置部分 ESC 配置和分配站地址。操作前停机，并确保该 EtherCAT 段没有其他主站运行。在状态监测模式下，扫描后保持 INIT。同一段总线更换设备后可断开重连重新识别。IgH 模式可用于观察已经运行的 IgH 主站，AL 状态码列中 `—` 表示接口未提供该字段。参见 [IgH 应用接口](https://docs.etherlab.org/ethercat/1.6/doxygen/group__ApplicationInterface.html) 和 [SOEM 2.0.0 源码](https://github.com/OpenEtherCATsociety/SOEM/tree/v2.0.0)。
 
+## 通用从站调试
+
+`ethercat-service` 是 Rust 调试入口，与桌面程序使用相同的 SOEM 和 IgH 后端可执行文件。先按下文构建原生后端，设置 `ECAT_MONITOR_BACKEND_DIR` 或将后端放在程序旁。扫描、通用 PDO、同步配置和 EEPROM 服务均可从该入口运行。示例中的从站位置从 0 开始。
+
+```bash
+cargo build --release --locked --no-default-features --bin ethercat-service
+./target/release/ethercat-service scan igh 0 --exclusive
+./target/release/ethercat-service process soem enp4s0 1000 freerun --exclusive
+./target/release/ethercat-service process igh 0 1000 0x0300 --exclusive --allow-outputs
+```
+
+- `process` 列出 PDO 和条目的方向、对象索引、位宽与实际位偏移。`read ID` 读取有效样本，`set ID VALUE` 写入至多 64 位的 RxPDO 原始值。通过 `--allow-outputs` 启用显式写入。过程数据会话请求 OP，初始输出为零。`quit` 关闭会话。
+- SOEM 从在线 CoE 映射读取布局，无 CoE 时从 SII 读取。同一从站每个方向支持一个过程数据 SyncManager，布局须与实际 IOmap 一致。IgH 通过内核主站读取在线映射并按条目位置注册 PDO。
+- `freerun` 使用主机调度。DC 使用 ESI 中的 SYNC0 AssignActivate，目前支持单从站。SOEM 接受 `0x0300`，并用参考时钟调节发送周期。IgH 用应用时间同步参考时钟及从站时钟。模式在新会话启动时配置。
+- CiA402 从映射中匹配控制字 `0x6040:00` 和状态字 `0x6041:00`。`drive 0 status` 显示状态。`drive 0 enable` 按在线状态推进使能序列，`reset` 发送故障复位脉冲，`disable` 禁止电压，`stop` 发送快速停止控制字。映射 `0x6060:00` 时可用 `drive 0 mode 8` 写入模式，映射 `0x6061:00` 时 `status` 显示模式反馈。
+
+### ESI 更新 EEPROM
+
+```bash
+./target/release/ethercat-service esi igh 0 0 device.xml original.sii --exclusive
+./target/release/ethercat-service esi-plan device.xml original.sii prepared.sii
+./target/release/ethercat-service esi soem enp4s0 0 device.xml before-write.sii --exclusive --write
+```
+
+默认读取并备份在线 SII，再根据匹配厂商、产品、修订号的 ESI 生成 TxPDO/RxPDO 类别。身份、PDI 配置、CRC、序列号和其他类别从原镜像保留。通过 `--write` 执行写入。备份路径须为新文件。SOEM 逐字写入并读回，IgH 调用与内核主站配套的 `ethercat` 工具写入镜像前缀，随后重扫并核对 SII。可用 `ETHERCAT_TOOL` 指定该工具路径。
+
+Rust 的过程变量、CiA402 和 ESI 流程移植自 SimpleCAT 的 `src/tc3_scan.c`、`ui/ui_master.c` 和 `src/esi_flash.c`，原生后端沿用本仓库的 SOEM 与 IgH 接口。上游版本为 `7bf6be13d05e09aad3045542d7f976ce20d5b444`。 [SimpleCAT 源代码](https://github.com/NutHero/SimpleCAT-EtherCAT-MasterV1.0.0/tree/7bf6be13d05e09aad3045542d7f976ce20d5b444) · [GPL-3.0 许可](COPYING.SimpleCAT)
+
 ## HPM5E31-KIT PDO 采集
 
 1. 将单台 HPM5E31-KIT 直连主站网卡，运行仓库中的 P0/PDI 相位诊断固件。程序按厂商 ID `0x00024121`、产品代码 `0x00000001` 以及 CoE PDO 分配和映射校验设备。
-2. 选择 IgH 或 SOEM，输入主站编号或网卡，勾选「HPM PDO」。停止该总线上的其他主站应用，确认后连接。IgH 模式会独占内核主站并创建 PDO 域，SOEM 模式会初始化总线并请求 SAFE-OP、OP。两种模式均固定发送 `0x7010:00 = 0`。
-3. 查看原始输入、WKC、GPIO 位和 PDI 相位。点击 GPIO 位即可切换对应的阶梯曲线。演示模式也支持 PDO 曲线。
+2. 选择 IgH 或 SOEM，输入主站编号或网卡，勾选「PDO 采集」。停止该总线上的其他主站应用，确认后连接。IgH 模式会独占内核主站并创建 PDO 域，SOEM 模式会初始化总线并请求 SAFE-OP、OP。两种模式均固定发送 `0x7010:00 = 0`。
+3. 在左侧选择 HPM5E31-KIT，展开「过程变量」。点击 GPIO 通道可独立添加或隐藏对应的阶梯曲线，每个通道独占一行。中央波形区显示原始输入、WKC、GPIO 和 PDI 相位。演示模式也支持 PDO 曲线。
 
 | 输入对象 | 字段 | 含义 |
 | --- | --- | --- |
 | `0x6000:00`，32 位小端 | 位 0–15 | GPIO 输入位图。仓库固件将 IN1 和 IN2 映射到位 0 和位 1。 |
 | 同上 | 位 16–31 | PDI 相位，单位 µs。`0xffff` 表示该字段无有效样本。 |
 
-曲线显示最近 10 秒。无有效 PDO 的周期在两张图上留空，`0xffff` 仅使相位曲线留空。SOEM 显示实际和期望 WKC，IgH 使用 PDO 域的完整性状态决定样本是否有效。断开后界面保留上一次记录。正常断开时，SOEM 请求 SAFE-OP，IgH 释放主站和域。
+曲线保留最近 10 秒，时间轴以本次采集起点为零。两张图共用时间轴。在图内滚轮缩放时间轴，Ctrl+滚轮缩放当前图的 Y 轴，拖动平移。浏览历史时采集继续进行。双击图表或点击「恢复跟随」可回到最新记录和自动量程。无有效 PDO 的周期在两张图上留空，`0xffff` 仅使相位曲线留空。SOEM 显示实际和期望 WKC，IgH 使用 PDO 域的完整性状态决定样本是否有效。断开后界面保留上一次记录。正常断开时，SOEM 请求 SAFE-OP，IgH 释放主站和域。
 
 目标采集周期为 100–20000 µs，默认 5000 µs。采集使用固定周期，跳过已错过的时隙。2000 µs 及更短周期使用忙等减少唤醒抖动，会占用 CPU。实际周期受操作系统调度和报文往返影响，曲线按软件收到样本的单调时钟绘制。此版本使用非 DC 采集。当前机型适配针对单台板卡和 [仓库里的 PDI 相位固件](../../firmware/hpm5e31/README.md)，其他固件即使 PDO 大小相同也可能采用不同的高 16 位语义。
 

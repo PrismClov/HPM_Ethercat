@@ -78,6 +78,7 @@ static int run_pdo(ecx_contextt *context, int count, int echo)
     (void)exchange(context, slave, 0, NULL);
     slave->state = EC_STATE_OPERATIONAL;
     int result = 1;
+    uint32_t next_token = 0;
     if (ecx_writestate(context, 1) <= 0)
     {
         pdo_error("Could not request OP from the HPM slave.");
@@ -103,7 +104,6 @@ static int run_pdo(ecx_contextt *context, int count, int echo)
     }
 
     int responding = 1;
-    uint32_t next_token = 0;
     uint64_t first_valid_ns = 0;
     for (int request = 'S'; request; request = next_request())
     {
@@ -159,12 +159,22 @@ stop:
     return result;
 }
 
+#include "soem_process.h"
+#include "soem_eeprom.h"
+
 int main(int argc, char **argv)
 {
     static ecx_contextt context;
     int echo = argc == 3 && strcmp(argv[2], "--pdo-echo") == 0;
     int pdo = echo || (argc == 3 && strcmp(argv[2], "--pdo") == 0);
-    if ((argc != 2 && !pdo) || !argv[1][0])
+    uint32_t period = 0;
+    unsigned assign = 0;
+    int process = image_options(argc, argv, &period, &assign);
+    unsigned eeprom_pos;
+    char extra;
+    int eeprom = argc == 4 && strcmp(argv[2], "--eeprom") == 0 &&
+                 sscanf(argv[3], "%u %c", &eeprom_pos, &extra) == 1;
+    if ((argc != 2 && !pdo && !process && !eeprom) || !argv[1][0])
         return 2;
 
     if (!ecx_init(&context, argv[1]))
@@ -197,9 +207,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (pdo)
+    if (pdo || process || eeprom)
     {
-        int result = run_pdo(&context, count, echo);
+        int result = eeprom ? soem_eeprom(&context, count, eeprom_pos)
+            : process ? soem_process(&context, count, period, assign)
+            : run_pdo(&context, count, echo);
         ecx_close(&context);
         return result;
     }

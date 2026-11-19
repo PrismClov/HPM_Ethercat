@@ -211,12 +211,17 @@ static int run_pdo(ec_master_t *master, int echo)
     return 0;
 }
 
+#include "igh_process.h"
+
 int main(int argc, char **argv)
 {
     char *end;
     int echo = argc == 3 && strcmp(argv[2], "--pdo-echo") == 0;
-    if ((argc != 2 && argc != 3) || argv[1][0] < '0' || argv[1][0] > '9' ||
-        (argc == 3 && !echo && strcmp(argv[2], "--pdo") != 0))
+    uint32_t period = 0;
+    unsigned assign = 0;
+    int process = image_options(argc, argv, &period, &assign);
+    int pdo = echo || (argc == 3 && strcmp(argv[2], "--pdo") == 0);
+    if ((argc != 2 && !pdo && !process) || argv[1][0] < '0' || argv[1][0] > '9')
         return 2;
     errno = 0;
     unsigned long index = strtoul(argv[1], &end, 10);
@@ -230,9 +235,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (argc == 3)
+    if (pdo || process)
     {
-        int result = next_request() ? run_pdo(master, echo) : 0;
+        int result = process ? igh_process(master, period, assign)
+                             : (next_request() ? run_pdo(master, echo) : 0);
         ecrt_release_master(master);
         return result;
     }

@@ -1,12 +1,13 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod pdo;
+mod workbench;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32};
 use ethercat_monitor::backend::{Backend, Session, Snapshot, Update};
 use std::{fs, time::Duration};
 
-const GOOD: Color32 = Color32::from_rgb(91, 218, 164);
+const GOOD: Color32 = Color32::from_rgb(98, 222, 183);
 const WARN: Color32 = Color32::from_rgb(246, 193, 100);
 const FAULT: Color32 = Color32::from_rgb(252, 127, 128);
 
@@ -22,6 +23,7 @@ struct Monitor {
     stopping: bool,
     snapshot: Option<Snapshot>,
     error: Option<String>,
+    selected_slave: Option<u32>,
 }
 
 impl Default for Monitor {
@@ -31,13 +33,14 @@ impl Default for Monitor {
             target: String::new(),
             interval_ms: 500,
             pdo_cycle_us: 5000,
-            pdo_enabled: false,
+            pdo_enabled: true,
             pdo_view: pdo::PdoView::default(),
             bus_confirmed: false,
             session: None,
             stopping: false,
             snapshot: None,
             error: None,
+            selected_slave: None,
         }
     }
 }
@@ -81,6 +84,7 @@ impl Monitor {
                     });
                 if self.backend != previous {
                     self.target = self.backend.default_target().into();
+                    self.pdo_enabled = self.backend == Backend::Demo;
                     self.bus_confirmed = false;
                     self.error = None;
                     self.pdo_view = pdo::PdoView::default();
@@ -107,7 +111,7 @@ impl Monitor {
                         }
                     }
                 }
-                if ui.checkbox(&mut self.pdo_enabled, "HPM PDO").changed() {
+                if ui.checkbox(&mut self.pdo_enabled, "PDO 采集").changed() {
                     self.bus_confirmed = false;
                     self.pdo_view = pdo::PdoView::default();
                 }
@@ -149,8 +153,15 @@ impl Monitor {
                     self.stopping = true;
                     session.stop();
                 }
-            } else if ui.add_enabled(valid, egui::Button::new("连接")).clicked() {
+            } else if ui
+                .add_enabled(
+                    valid,
+                    egui::Button::new("连接").fill(Color32::from_rgb(23, 76, 82)),
+                )
+                .clicked()
+            {
                 self.error = None;
+                self.selected_slave = None;
                 self.pdo_view = pdo::PdoView::default();
                 let repaint = ui.ctx().clone();
                 self.session = Some(Session::start(
@@ -229,56 +240,6 @@ impl Monitor {
             ));
         });
     }
-
-    fn table(&self, ui: &mut egui::Ui) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        if snapshot.slaves.is_empty() || self.stopping {
-            return;
-        }
-        egui::ScrollArea::new([true, !self.pdo_enabled])
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("slave_table")
-                    .striped(true)
-                    .min_col_width(70.0)
-                    .spacing([20.0, 12.0])
-                    .show(ui, |ui| {
-                        for header in [
-                            "位置",
-                            "从站名称",
-                            "厂商 ID",
-                            "产品代码",
-                            "修订号",
-                            "AL 状态",
-                            "AL 状态码",
-                        ] {
-                            ui.strong(header);
-                        }
-                        ui.end_row();
-                        for slave in &snapshot.slaves {
-                            ui.monospace(slave.position.to_string());
-                            ui.label(if slave.name.is_empty() {
-                                "—"
-                            } else {
-                                &slave.name
-                            });
-                            ui.monospace(format!("0x{:08X}", slave.vendor));
-                            ui.monospace(format!("0x{:08X}", slave.product));
-                            ui.monospace(format!("0x{:08X}", slave.revision));
-                            let (label, color) = al_state(slave.state);
-                            ui.colored_label(color, label);
-                            ui.monospace(
-                                slave
-                                    .al_code
-                                    .map_or("—".into(), |code| format!("0x{code:04X}")),
-                            );
-                            ui.end_row();
-                        }
-                    });
-            });
-    }
 }
 
 fn al_state(raw: Option<u16>) -> (String, Color32) {
@@ -306,26 +267,7 @@ impl eframe::App for Monitor {
         if self.session.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(RichText::new("EtherCAT 总线监测").size(28.0));
-            ui.add_space(12.0);
-            self.controls(ui);
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            self.overview(ui);
-            ui.add_space(12.0);
-            if self.pdo_enabled {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.pdo_view
-                        .show(ui, self.session.is_some() && !self.stopping);
-                    ui.add_space(12.0);
-                    self.table(ui);
-                });
-            } else {
-                self.table(ui);
-            }
-        });
+        self.workbench(ctx);
     }
 }
 
@@ -352,8 +294,8 @@ fn configure_font(ctx: &egui::Context) {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1020.0, 630.0])
-            .with_min_inner_size([680.0, 400.0]),
+            .with_inner_size([1200.0, 760.0])
+            .with_min_inner_size([720.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -361,19 +303,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|creation| {
             creation.egui_ctx.set_theme(egui::Theme::Dark);
-            creation.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
-                style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-                style.spacing.interact_size.y = 26.0;
-                for text_style in [
-                    egui::TextStyle::Body,
-                    egui::TextStyle::Button,
-                    egui::TextStyle::Monospace,
-                ] {
-                    if let Some(font) = style.text_styles.get_mut(&text_style) {
-                        font.size = 14.0;
-                    }
-                }
-            });
+            workbench::configure_theme(&creation.egui_ctx);
             configure_font(&creation.egui_ctx);
             Ok(Box::new(Monitor::default()))
         }),
