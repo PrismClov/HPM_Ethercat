@@ -145,8 +145,8 @@ def main():
     parser.add_argument("seconds", type=int)
     parser.add_argument("periods", type=int, nargs="+")
     args = parser.parse_args()
-    if not 1 <= args.seconds <= 600 or any(not 100 <= p <= 20000 for p in args.periods):
-        parser.error("Duration must be 1–600 s, period 100–20000 µs")
+    if not 1 <= args.seconds <= 600 or any(not 50 <= p <= 20000 for p in args.periods):
+        parser.error("Duration must be 1–600 s, period 50–20000 µs")
     if sys.platform == "linux" and "microsoft" in os.uname().release.lower():
         parser.error("Use a native Linux or Windows host for this direct-link benchmark")
     header = ["target_us", "duration_s", "slots", "sent", "echoed", "not_op",

@@ -134,6 +134,24 @@ static int run_pdo(ec_master_t *master, int echo)
         ecrt_domain_state(domain, &domain_state);
         ecrt_slave_config_state(config, &state);
 
+        if (state.operational && domain_state.wc_state == EC_WC_ZERO)
+        {
+            /* Give a late reply a bounded chance to arrive before re-queuing
+             * the same domain datagram. An unmatched reply cannot update PDOs. */
+            const uint64_t deadline_ns = monotonic_ns() + UINT64_C(80000);
+            uint64_t now;
+            while ((now = monotonic_ns()) != 0 && now < deadline_ns)
+            {
+                ecrt_master_receive(master);
+                if (echo)
+                    rx_ns = monotonic_ns();
+                ecrt_domain_process(domain);
+                ecrt_domain_state(domain, &domain_state);
+                if (domain_state.wc_state != EC_WC_ZERO)
+                    break;
+            }
+        }
+
         ec_master_state_t master_state = {0};
         if (request == 'S')
         {
