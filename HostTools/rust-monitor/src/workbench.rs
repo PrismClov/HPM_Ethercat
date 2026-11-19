@@ -47,7 +47,7 @@ struct Profile {
     watches: Vec<Watch>,
     left: f32,
     right: f32,
-    bottom: f32,
+    event_height: f32,
 }
 
 impl Default for Profile {
@@ -60,8 +60,8 @@ impl Default for Profile {
             activation: "0x0300".into(),
             watches: Vec::new(),
             left: 0.16,
-            right: 0.24,
-            bottom: 0.40,
+            right: 0.25,
+            event_height: 0.17,
         }
     }
 }
@@ -115,7 +115,7 @@ impl Workbench {
             proportions: [
                 profile.left.clamp(0.12, 0.33),
                 profile.right.clamp(0.15, 0.36),
-                profile.bottom.clamp(0.20, 0.65),
+                profile.event_height.clamp(0.10, 0.35),
             ],
         }
     }
@@ -135,10 +135,16 @@ impl Workbench {
             cycle_us: self.app.cycle_us,
             dc: self.app.dc,
             activation: self.app.activation.clone(),
-            watches: self.app.watches.clone(),
+            watches: self
+                .app
+                .watches
+                .iter()
+                .filter(|watch| !watch.is_default_mapping())
+                .cloned()
+                .collect(),
             left: self.proportions[0],
             right: self.proportions[1],
-            bottom: self.proportions[2],
+            event_height: self.proportions[2],
         };
         let Some(parent) = path.parent() else {
             return Ok(());
@@ -164,29 +170,25 @@ impl eframe::App for Workbench {
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("EtherCAT 工作台").size(18.0).strong());
                     ui.separator();
-                    for (open, label) in self.panels.iter_mut().zip(["从站树", "观察", "时间轴"])
+                    for (open, label) in self.panels.iter_mut().zip(["从站树", "变量", "事件"])
                     {
                         if ui.selectable_label(*open, label).clicked() {
                             *open = !*open;
                         }
                     }
+                    self.app.esi_tab(ui);
                 });
                 self.app.controls(ui);
             });
-        egui::TopBottomPanel::bottom("bus_status")
-            .frame(surface(12, 4))
-            .show(ctx, |ui| {
-                self.app.status(ui);
-            });
         if self.panels[2] {
-            let response = egui::TopBottomPanel::bottom("trace")
+            let response = egui::TopBottomPanel::bottom("events")
                 .resizable(true)
-                .height_range(155.0..=(size.y * 0.65).max(155.0))
+                .height_range(74.0..=(size.y * 0.35).max(74.0))
                 .default_height(size.y * self.proportions[2])
                 .frame(surface(10, 4))
-                .show(ctx, |ui| self.timeline.show(&mut self.app, ui));
+                .show(ctx, |ui| self.timeline.events(&mut self.app, ui));
             self.proportions[2] =
-                (response.response.rect.height() / size.y.max(1.0)).clamp(0.20, 0.65);
+                (response.response.rect.height() / size.y.max(1.0)).clamp(0.10, 0.35);
         }
         if self.panels[0] {
             let shown = egui::SidePanel::left("topology")
@@ -195,8 +197,10 @@ impl eframe::App for Workbench {
                 .width_range(143.0..=(size.x * 0.33).max(143.0))
                 .frame(surface(10, 8))
                 .show(ctx, |ui| {
+                    ui.set_min_width(ui.available_width());
                     egui::ScrollArea::vertical()
                         .id_salt("topology_rows")
+                        .auto_shrink([false, true])
                         .show(ui, |ui| self.app.sidebar(ui));
                 });
             self.proportions[0] = (shown.response.rect.width() / size.x.max(1.0)).clamp(0.12, 0.33);
@@ -205,9 +209,10 @@ impl eframe::App for Workbench {
             let shown = egui::SidePanel::right("watch")
                 .resizable(true)
                 .default_width(size.x * self.proportions[1])
-                .width_range(190.0..=(size.x * 0.36).max(190.0))
+                .width_range(211.0..=(size.x * 0.36).max(211.0))
                 .frame(surface(10, 8))
                 .show(ctx, |ui| {
+                    ui.set_min_width(ui.available_width());
                     egui::ScrollArea::vertical()
                         .id_salt("watch_rows")
                         .show(ui, |ui| trace_view::observations(&mut self.app, ui));
@@ -216,7 +221,7 @@ impl eframe::App for Workbench {
         }
         egui::CentralPanel::default()
             .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(12)))
-            .show(ctx, |ui| self.app.central(ui));
+            .show(ctx, |ui| self.app.central(ui, &mut self.timeline));
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {

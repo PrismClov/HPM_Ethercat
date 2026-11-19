@@ -6,7 +6,7 @@ default-run = "ethercat-monitor"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:eframe", "dep:serde", "dep:serde_json"]
+desktop = ["dep:eframe", "dep:serde", "dep:serde_json", "dep:rfd"]
 
 [[bin]]
 name = "ethercat-monitor"
@@ -22,3 +22,4 @@ eframe = { version = "0.31.1", optional = true, default-features = false, featur
 xml-rs = "0.8.29"
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
+rfd = { version = "0.15.4", optional = true }

@@ -1,5 +1,5 @@
 use crate::{
-    advanced::Advanced,
+    advanced::{number, Advanced},
     trace::{Display, History, Key, Recorded, Source},
     FAULT, GOOD, WARN,
 };
@@ -16,15 +16,25 @@ const COLORS: [Color32; 8] = [
     Color32::from_rgb(219, 221, 132),
     Color32::from_rgb(181, 195, 215),
 ];
+const WATCH_ROW_HEIGHT: f32 = 24.0;
+const WATCH_COLUMN_GAP: f32 = 4.0;
+const WATCH_DIRECTION_WIDTH: f32 = 22.0;
+const WATCH_FORMAT_WIDTH: f32 = 36.0;
+const WATCH_ACTION_WIDTH: f32 = 20.0;
+const WATCH_CELL_PADDING: i8 = 2;
+
+pub(super) struct WatchEdit {
+    key: Key,
+    draft: String,
+    focus: bool,
+}
 
 pub fn observations(app: &mut Advanced, ui: &mut egui::Ui) {
+    let mut edit = app.watch_edit.take();
     ui.horizontal_wrapped(|ui| {
         ui.heading("观察变量");
         if ui.small_button("+ WKC").clicked() {
-            app.add_watch(Key::wkc(), None, true);
-        }
-        if app.history.cursor.is_some() && ui.small_button("恢复实时").clicked() {
-            app.history.cursor = None;
+            app.add_watch(Key::wkc(), None, false);
         }
     });
     let frame = app.history.observed();
@@ -42,9 +52,15 @@ pub fn observations(app: &mut Advanced, ui: &mut egui::Ui) {
         ));
     }
     if app.watches.is_empty() {
-        ui.weak("在过程数据表点「+观察」或「+波形」。");
+        ui.weak("启动 PDO 后会自动列出从站变量。");
         return;
     }
+    let split_keys: Vec<_> = app
+        .watches
+        .iter()
+        .filter(|watch| watch.id.is_some() && app.can_split(&watch.key))
+        .map(|watch| watch.key.clone())
+        .collect();
     let mut groups: Vec<_> = app
         .watches
         .iter()
@@ -52,9 +68,11 @@ pub fn observations(app: &mut Advanced, ui: &mut egui::Ui) {
         .collect();
     groups.sort();
     groups.dedup();
-    let name_width = (ui.available_width() * 0.25).clamp(54.0, 90.0);
-    let value_width = (ui.available_width() * 0.35).clamp(63.0, 120.0);
+    let writable = app.writable();
+    let mut next_edit = None;
+    let mut write = None;
     let mut remove = None;
+    let mut split = None;
     for group in groups {
         ui.push_id(&group, |ui| {
             egui::CollapsingHeader::new(if group.trim().is_empty() {
@@ -64,75 +82,267 @@ pub fn observations(app: &mut Advanced, ui: &mut egui::Ui) {
             })
             .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new("watch_table")
-                    .striped(true)
-                    .spacing(vec2(4.0, 2.0))
-                    .show(ui, |ui| {
-                        for title in ["态", "变量", "值", "格式", ""] {
-                            ui.weak(title);
+                let actions_width = 2.0 * WATCH_ACTION_WIDTH + WATCH_COLUMN_GAP;
+                let data_width = ui.available_width()
+                    - WATCH_DIRECTION_WIDTH
+                    - WATCH_FORMAT_WIDTH
+                    - actions_width
+                    - 4.0 * WATCH_COLUMN_GAP;
+                let name_width = (data_width * 0.42).round().clamp(20.0, 96.0);
+                let value_width = (data_width - name_width).floor().clamp(32.0, 124.0);
+                ui.spacing_mut().item_spacing = vec2(WATCH_COLUMN_GAP, 4.0);
+                ui.horizontal(|ui| {
+                    for (title, width, padding) in [
+                        ("I/O", WATCH_DIRECTION_WIDTH, 0),
+                        ("变量", name_width, WATCH_CELL_PADDING),
+                        ("值", value_width, WATCH_CELL_PADDING),
+                        ("格式", WATCH_FORMAT_WIDTH, 0),
+                    ] {
+                        watch_cell(ui, width, padding, |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(title).weak()).truncate())
+                        });
+                    }
+                });
+                let mut rows: Vec<_> = app
+                    .watches
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(_, w)| w.group == group)
+                    .map(|(id, watch)| {
+                        let section = match watch.key.source {
+                            Source::Wkc => 2,
+                            _ if watch.key.output => 0,
+                            _ => 1,
+                        };
+                        (section, id, watch)
+                    })
+                    .collect();
+                rows.sort_by_key(|(section, _, _)| *section);
+                let mut previous_section = None;
+                for (row, (section, id, watch)) in rows.into_iter().enumerate() {
+                    if previous_section != Some(section) {
+                        if previous_section.is_some() {
+                            ui.add_space(4.0);
                         }
-                        ui.end_row();
-                        for (id, watch) in app
-                            .watches
-                            .iter_mut()
-                            .enumerate()
-                            .filter(|(_, w)| w.group == group)
-                        {
-                            let value = frame.and_then(|frame| watch.formatted(frame));
-                            let validity = if value.is_some() {
-                                "有效"
-                            } else if watch.id.is_none() && watch.key.source != Source::Wkc {
-                                "未映射"
-                            } else {
-                                "该周期无有效值"
-                            };
-                            ui.colored_label(
-                                if value.is_some() {
-                                    GOOD
+                        let (title, color) = [
+                            ("Rx · 从站接收", COLORS[0]),
+                            ("Tx · 从站发送", GOOD),
+                            ("总线状态", ui.visuals().weak_text_color()),
+                        ][section];
+                        ui.label(egui::RichText::new(title).size(12.0).strong().color(color));
+                        previous_section = Some(section);
+                    }
+                    let stripe = ui.painter().add(egui::Shape::Noop);
+                    let response = ui
+                        .push_id(id, |ui| {
+                            ui.horizontal(|ui| {
+                                let value = frame.and_then(|frame| watch.formatted(frame));
+                                let validity = if value.is_some() {
+                                    "有效"
+                                } else if watch.id.is_none() && watch.key.source != Source::Wkc {
+                                    "未映射"
                                 } else {
-                                    ui.visuals().weak_text_color()
-                                },
-                                "●",
-                            )
-                            .on_hover_text(validity);
-                            let caption = match watch.key.source {
-                                Source::Pdo => {
-                                    format!("{:04X}:{:02X}", watch.key.index, watch.key.sub)
-                                }
-                                Source::Gpio => "GPIO".into(),
-                                Source::Pdi => "PDI 相位".into(),
-                                Source::Wkc => "WKC".into(),
-                            };
-                            fixed_label(ui, &caption, name_width, false).on_hover_text(format!(
-                                "{} · {} 位 · 偏移 {}",
-                                watch.key.caption(),
-                                watch.key.width,
-                                watch.key.offset
-                            ));
-                            let value = value.unwrap_or_else(|| "—".into());
-                            fixed_label(ui, &value, value_width, true).on_hover_text(&value);
-                            ui.push_id(id, |ui| {
-                                ui.menu_button(display_name(watch.display), |ui| {
-                                    for (display, label) in [
-                                        (Display::Hex, "十六进制"),
-                                        (Display::Decimal, "十进制"),
-                                        (Display::Bits, "位域"),
-                                    ] {
-                                        if ui
-                                            .selectable_value(&mut watch.display, display, label)
-                                            .clicked()
-                                        {
-                                            ui.close_menu();
-                                        }
+                                    "该周期无有效值"
+                                };
+                                let (direction, description, color) = match watch.key.source {
+                                    Source::Wkc => ("●", "总线状态", GOOD),
+                                    _ if watch.key.output => {
+                                        ("Rx", "主站 → 从站（从站接收）", COLORS[0])
                                     }
+                                    _ => ("Tx", "从站 → 主站（从站发送）", GOOD),
+                                };
+                                watch_cell(ui, WATCH_DIRECTION_WIDTH, 0, |ui| {
+                                    let color = value
+                                        .as_ref()
+                                        .map_or_else(|| ui.visuals().weak_text_color(), |_| color);
+                                    ui.label(
+                                        egui::RichText::new(direction)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(color),
+                                    )
+                                })
+                                .on_hover_text(format!("{description} · {validity}"));
+                                let caption = match watch.key.source {
+                                    Source::Pdo => {
+                                        format!("{:04X}:{:02X}", watch.key.index, watch.key.sub)
+                                    }
+                                    Source::Gpio => "GPIO".into(),
+                                    Source::Pdi => "PDI 相位".into(),
+                                    Source::Wkc => "WKC".into(),
+                                };
+                                fixed_label(ui, &caption, name_width, egui::Sense::hover())
+                                    .on_hover_text(format!(
+                                        "{} · {}PDO 0x{:04X} · {} 位 · 偏移 {}",
+                                        watch.key.caption(),
+                                        if watch.key.output { "Rx" } else { "Tx" },
+                                        watch.key.pdo,
+                                        watch.key.width,
+                                        watch.key.offset
+                                    ));
+                                let editable = writable
+                                    && value.is_some()
+                                    && watch.key.source == Source::Pdo
+                                    && watch.key.output
+                                    && (1..=64).contains(&watch.key.width)
+                                    && watch.id.is_some();
+                                let value = value.unwrap_or_else(|| "—".into());
+                                let sense = if editable {
+                                    egui::Sense::click()
+                                } else {
+                                    egui::Sense::hover()
+                                };
+                                if let Some(mut active) =
+                                    edit.take_if(|active| editable && active.key == watch.key)
+                                {
+                                    let editor_id = ui.id().with(("watch_value", watch.id));
+                                    let focused = ui.memory(|memory| memory.has_focus(editor_id));
+                                    let (submit, cancel) = if focused {
+                                        ui.input_mut(|input| {
+                                            (
+                                                input.consume_key(
+                                                    egui::Modifiers::NONE,
+                                                    egui::Key::Enter,
+                                                ),
+                                                input.consume_key(
+                                                    egui::Modifiers::NONE,
+                                                    egui::Key::Escape,
+                                                ),
+                                            )
+                                        })
+                                    } else {
+                                        (false, false)
+                                    };
+                                    let parsed = number(&active.draft).filter(|value| {
+                                        value.checked_shr(u32::from(watch.key.width)).unwrap_or(0)
+                                            == 0
+                                    });
+                                    let editor = egui::TextEdit::singleline(&mut active.draft)
+                                        .id(editor_id)
+                                        .font(egui::FontId::monospace(12.0))
+                                        .vertical_align(egui::Align::Center)
+                                        .margin(egui::Margin::symmetric(WATCH_CELL_PADDING, 0))
+                                        .min_size(vec2(value_width, WATCH_ROW_HEIGHT));
+                                    let editor = if parsed.is_none() {
+                                        editor.text_color(FAULT)
+                                    } else {
+                                        editor
+                                    };
+                                    let response =
+                                        watch_cell(ui, value_width, 0, |ui| ui.add(editor))
+                                            .on_hover_text(
+                                                "支持十进制或 0x 十六进制 · Enter 写入 · Esc 取消",
+                                            );
+                                    if active.focus {
+                                        response.request_focus();
+                                        if let Some(mut state) =
+                                            egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                        {
+                                            state.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::two(
+                                                    egui::text::CCursor::new(0),
+                                                    egui::text::CCursor::new(
+                                                        active.draft.chars().count(),
+                                                    ),
+                                                ),
+                                            ));
+                                            state.store(ui.ctx(), editor_id);
+                                        }
+                                        active.focus = false;
+                                    }
+                                    if submit && !cancel && parsed.is_some() {
+                                        write = parsed.map(|value| (active.key, value));
+                                    } else if !cancel && response.has_focus() && next_edit.is_none()
+                                    {
+                                        next_edit = Some(active);
+                                    }
+                                } else if editable {
+                                    let cell = fixed_label(ui, &value, value_width, sense);
+                                    if cell
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(format!("{value}\n双击编辑输出值"))
+                                        .double_clicked()
+                                    {
+                                        let draft = if watch.display == Display::Bits {
+                                            frame
+                                                .and_then(|frame| watch.value(frame))
+                                                .map_or_else(String::new, |value| value.to_string())
+                                        } else {
+                                            value
+                                        };
+                                        next_edit = Some(WatchEdit {
+                                            key: watch.key.clone(),
+                                            draft,
+                                            focus: true,
+                                        });
+                                    }
+                                } else {
+                                    fixed_label(ui, &value, value_width, sense)
+                                        .on_hover_text(&value);
+                                }
+                                watch_cell(ui, WATCH_FORMAT_WIDTH, 0, |ui| {
+                                    let format = egui::Button::new(display_name(watch.display))
+                                        .small()
+                                        .min_size(vec2(WATCH_FORMAT_WIDTH, WATCH_ROW_HEIGHT));
+                                    egui::menu::menu_custom_button(ui, format, |ui| {
+                                        for (display, label) in [
+                                            (Display::Hex, "十六进制"),
+                                            (Display::Decimal, "十进制"),
+                                            (Display::Bits, "位域"),
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut watch.display,
+                                                    display,
+                                                    label,
+                                                )
+                                                .clicked()
+                                            {
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
                                 });
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    if wave_toggle(ui, watch.plotted) {
+                                watch_cell(ui, actions_width, 0, |ui| {
+                                    ui.spacing_mut().item_spacing.x = WATCH_COLUMN_GAP;
+                                    ui.spacing_mut().button_padding.x = 2.0;
+                                    if wave_toggle(
+                                        ui,
+                                        watch.plotted,
+                                        watch.key.source != Source::Wkc,
+                                    ) {
                                         watch.plotted = !watch.plotted;
                                     }
                                     let group_edit = ui.id().with("group_edit");
-                                    let menu = ui.menu_button("···", |ui| {
+                                    let more = egui::Button::new("···")
+                                        .small()
+                                        .min_size(vec2(WATCH_ACTION_WIDTH, WATCH_ROW_HEIGHT));
+                                    let menu = egui::menu::menu_custom_button(ui, more, |ui| {
+                                        if watch.key.source == Source::Pdo && watch.key.width <= 64
+                                        {
+                                            if let Some(value) =
+                                                frame.and_then(|frame| watch.value(frame))
+                                            {
+                                                ui.label("位图（高位在左）");
+                                                ui.monospace(format!(
+                                                    "{value:0width$b}",
+                                                    width = usize::from(watch.key.width)
+                                                ));
+                                            }
+                                        }
+                                        if split_keys.contains(&watch.key) {
+                                            for (label, source) in [
+                                                ("GPIO 加入波形", Source::Gpio),
+                                                ("PDI 相位加入波形", Source::Pdi),
+                                            ] {
+                                                if ui.button(label).clicked() {
+                                                    let mut key = watch.key.clone();
+                                                    key.source = source;
+                                                    split = Some((key, watch.id));
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        }
                                         ui.label("分组");
                                         let mut draft = ui
                                             .data_mut(|data| data.get_temp::<String>(group_edit))
@@ -148,31 +358,59 @@ pub fn observations(app: &mut Advanced, ui: &mut egui::Ui) {
                                         } else {
                                             ui.data_mut(|data| data.insert_temp(group_edit, draft));
                                         }
-                                        if ui.small_button("移除").clicked() {
+                                        if (watch.key.source != Source::Pdo || watch.id.is_none())
+                                            && ui.small_button("移除").clicked()
+                                        {
                                             remove = Some(id);
                                             ui.close_menu();
                                         }
                                     });
                                     menu.response.on_hover_text("分组或移除");
                                 });
-                            });
-                            ui.end_row();
-                        }
-                    });
+                            })
+                            .response
+                        })
+                        .inner;
+                    if row % 2 == 0 {
+                        ui.painter().set(
+                            stripe,
+                            egui::Shape::rect_filled(
+                                response.rect,
+                                2.0,
+                                ui.visuals().faint_bg_color,
+                            ),
+                        );
+                    }
+                }
             });
         });
     }
     if let Some(id) = remove {
-        app.watches.remove(id);
+        let removed = app.watches.remove(id);
+        if next_edit
+            .as_ref()
+            .is_some_and(|active| active.key == removed.key)
+        {
+            next_edit = None;
+        }
+    }
+    app.watch_edit = next_edit;
+    if let Some((key, id)) = split {
+        app.add_watch(key, id, true);
+    }
+    if let Some((key, value)) = write {
+        app.write_observed_output(&key, value);
     }
 }
 
-fn wave_toggle(ui: &mut egui::Ui, plotted: bool) -> bool {
-    let response = ui.add(
+fn wave_toggle(ui: &mut egui::Ui, plotted: bool, enabled: bool) -> bool {
+    let plotted = plotted && enabled;
+    let response = ui.add_enabled(
+        enabled,
         egui::Button::new("")
             .small()
             .selected(plotted)
-            .min_size(vec2(20.0, 17.0)),
+            .min_size(vec2(WATCH_ACTION_WIDTH, WATCH_ROW_HEIGHT)),
     );
     let c = response.rect.center();
     let color = if plotted {
@@ -203,18 +441,39 @@ fn wave_toggle(ui: &mut egui::Ui, plotted: bool) -> bool {
         .clicked()
 }
 
-fn fixed_label(ui: &mut egui::Ui, text: &str, width: f32, right: bool) -> egui::Response {
-    let label = egui::Label::new(egui::RichText::new(text).monospace().size(12.0)).truncate();
-    ui.allocate_ui_with_layout(
-        vec2(width, 17.0),
-        if right {
-            egui::Layout::right_to_left(egui::Align::Center)
-        } else {
-            egui::Layout::left_to_right(egui::Align::Center)
-        },
-        |ui| ui.add(label),
-    )
-    .inner
+fn watch_cell<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    padding: i8,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, WATCH_ROW_HEIGHT), egui::Sense::hover());
+    let inner = rect.shrink2(vec2(f32::from(padding), 0.0));
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(response.id)
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cell.set_clip_rect(cell.clip_rect().intersect(rect));
+    contents(&mut cell)
+}
+
+fn fixed_label(ui: &mut egui::Ui, text: &str, width: f32, sense: egui::Sense) -> egui::Response {
+    let label = egui::Label::new(egui::RichText::new(text).monospace().size(12.0))
+        .truncate()
+        .sense(sense)
+        .halign(egui::Align::LEFT);
+    let label = if sense.senses_click() {
+        label.selectable(false)
+    } else {
+        label
+    };
+    watch_cell(ui, width, WATCH_CELL_PADDING, |ui| {
+        // Reserve the same space for the displayed value and the inline editor.
+        ui.add_sized(ui.available_size(), label)
+    })
 }
 
 fn display_name(display: Display) -> &'static str {
@@ -231,7 +490,7 @@ pub struct Timeline {
     hover: Option<(u64, Duration)>,
 }
 
-const GUTTER: f32 = 142.0;
+const GUTTER: f32 = 42.0;
 const GRID: Color32 = Color32::from_rgb(43, 58, 71);
 const CROSSHAIR: Color32 = Color32::from_rgb(114, 173, 190);
 
@@ -243,7 +502,10 @@ struct Plot {
 
 impl Plot {
     fn chart(&self, area: Rect) -> Rect {
-        Rect::from_min_max(pos2(area.left() + GUTTER, area.top()), area.right_bottom())
+        Rect::from_min_max(
+            pos2(area.left() + GUTTER.min(area.width() * 0.40), area.top()),
+            area.right_bottom(),
+        )
     }
 
     fn x(&self, chart: Rect, time: f64) -> f32 {
@@ -264,31 +526,21 @@ impl Plot {
 
 impl Timeline {
     pub fn show(&mut self, app: &mut Advanced, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("时间轴与事件");
-            if ui
-                .add_enabled(
-                    app.history.cursor.is_none() && !app.history.frames.is_empty(),
-                    egui::Button::new("暂停观察"),
-                )
-                .clicked()
-            {
-                if let Some(last) = app.history.frames.back() {
-                    app.history.select(last.id);
-                }
-            }
-            if ui
-                .add_enabled(app.history.cursor.is_some(), egui::Button::new("恢复实时"))
-                .clicked()
-            {
-                app.history.cursor = None;
-                self.past_end = None;
-            }
+        if app.history.cursor.is_some()
+            && app.watch_edit.is_none()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            app.history.cursor = None;
+            self.past_end = None;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("波形");
             if let Some(frame) = &app.history.cursor {
                 ui.colored_label(
                     WARN,
                     format!("游标 #{} · {:.6} s", frame.id, frame.time.as_secs_f64()),
-                );
+                )
+                .on_hover_text("按 Esc 返回实时波形");
             }
             if let Some((id, time)) = self.hover {
                 ui.colored_label(
@@ -322,141 +574,84 @@ impl Timeline {
             latest
         };
         let range = ((end - 3.0).max(0.0), end.max(0.05));
-        let mut hit = None;
-        let station = app.selected.unwrap_or(0);
-        let fault_indices = app.fault_indices();
-        let width = ui.available_width();
-        let mut hover = None;
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width((width - 230.0).max(240.0));
-                let mut plot = Plot {
-                    range,
-                    width: ui.available_width() - 12.0,
-                    hover: None,
-                };
-                let region = Rect::from_min_size(
-                    ui.next_widget_position(),
-                    vec2(plot.width, ui.available_height()),
-                );
-                let active = plot.chart(region);
-                if ui.rect_contains_pointer(active) {
-                    if let Some(frame) = ui
-                        .input(|input| input.pointer.hover_pos())
-                        .and_then(|p| nearest(&app.history, plot.time_at(active, p.x)))
-                    {
-                        hover = Some((frame.id, frame.time));
-                        plot.hover = Some(frame.time);
-                    }
-                }
-                hit = draw_axis(ui, &app.history, &plot).or(hit);
-                egui::ScrollArea::vertical()
-                    .id_salt("trace_lanes")
-                    .show(ui, |ui| {
-                        hit = draw_lane(
-                            ui,
-                            &app.history,
-                            &plot,
-                            "WKC",
-                            GOOD,
-                            Some((0.0, f64::from(last.expected.max(last.wkc).max(1)))),
-                            |f| u32::try_from(f.wkc).ok().map(f64::from),
-                        )
-                        .or(hit);
-                        for watch in app
-                            .watches
-                            .iter()
-                            .filter(|watch| watch.plotted && watch.key.source != Source::Wkc)
-                        {
-                            hit = draw_lane(
-                                ui,
-                                &app.history,
-                                &plot,
-                                &watch.key.caption(),
-                                COLORS[watch.color % COLORS.len()],
-                                None,
-                                |f| watch.value(f).map(|value| value as f64),
-                            )
-                            .or(hit);
-                        }
-                        hit = draw_lane(
-                            ui,
-                            &app.history,
-                            &plot,
-                            &format!("AL {station:02}（轮询）"),
-                            WARN,
-                            Some((0.0, 8.0)),
-                            |f| {
-                                f.al.iter()
-                                    .find(|al| al.station == station)?
-                                    .state
-                                    .map(f64::from)
-                            },
-                        )
-                        .or(hit);
-                        if !fault_indices.is_empty() {
-                            hit = draw_lane(
-                                ui,
-                                &app.history,
-                                &plot,
-                                "CiA402 故障",
-                                FAULT,
-                                Some((0.0, 1.0)),
-                                |f| {
-                                    f.valid.then(|| {
-                                        f64::from(u8::from(fault_indices.iter().any(|&id| {
-                                            f.values
-                                                .get(id)
-                                                .copied()
-                                                .flatten()
-                                                .is_some_and(|word| word & 8 != 0)
-                                        })))
-                                    })
-                                },
-                            )
-                            .or(hit);
-                        }
-                        hit = draw_lane(
-                            ui,
-                            &app.history,
-                            &plot,
-                            "周期偏差 µs",
-                            COLORS[5],
-                            None,
-                            |f| f.jitter_us,
-                        )
-                        .or(hit);
-                    });
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.heading("事件");
-                ui.set_width(208.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("trace_events")
-                    .show(ui, |ui| {
-                        if app.history.markers.is_empty() {
-                            ui.weak("当前记录无异常");
-                        }
-                        for marker in app.history.markers.iter().rev().take(100) {
-                            let is_selected = app
-                                .history
-                                .cursor
-                                .as_ref()
-                                .is_some_and(|cursor| cursor.id == marker.id);
-                            let text =
-                                egui::RichText::new(format!("#{}  {}", marker.id, marker.text))
-                                    .color(if marker.alarm { FAULT } else { WARN });
-                            if ui.selectable_label(is_selected, text).clicked() {
-                                hit = Some((
-                                    marker.id,
-                                    (marker.time.as_secs_f64() + 1.5).min(latest),
-                                ));
-                            }
-                        }
-                    });
+        let watches = || {
+            app.watches
+                .iter()
+                .filter(|watch| watch.plotted && watch.key.source != Source::Wkc)
+        };
+        ui.horizontal_wrapped(|ui| {
+            for watch in watches() {
+                ui.colored_label(COLORS[watch.color % COLORS.len()], watch.key.caption());
+            }
+            ui.weak(if watches().next().is_none() {
+                "点右栏变量的波形按钮添加曲线。"
+            } else {
+                "各通道独立归一化"
             });
         });
+
+        let mut plot = Plot {
+            range,
+            width: ui.available_width().max(1.0),
+            hover: None,
+        };
+        let region = Rect::from_min_size(
+            ui.next_widget_position(),
+            vec2(plot.width, ui.available_height()),
+        );
+        let active = plot.chart(region);
+        let hover = ui
+            .input(|input| input.pointer.hover_pos())
+            .filter(|_| ui.rect_contains_pointer(active))
+            .and_then(|p| nearest(&app.history, plot.time_at(active, p.x)))
+            .map(|frame| (frame.id, frame.time));
+        plot.hover = hover.map(|(_, time)| time);
+
+        let axis_hit = draw_axis(ui, &app.history, &plot);
+        let (area, response) = ui.allocate_exact_size(
+            vec2(plot.width, ui.available_height().max(1.0)),
+            egui::Sense::click_and_drag(),
+        );
+        let chart = plot.chart(area);
+        let painter = ui.painter();
+        let trace = painter.with_clip_rect(chart.intersect(ui.clip_rect()));
+        trace.rect_filled(chart, 2.0, ui.visuals().extreme_bg_color);
+        for tick in plot.ticks() {
+            let x = plot.x(chart, tick);
+            trace.line_segment(
+                [pos2(x, chart.top()), pos2(x, chart.bottom())],
+                Stroke::new(1.0_f32, GRID),
+            );
+        }
+        for percent in [0, 25, 50, 75, 100] {
+            let y = normalized_y(chart, f64::from(percent) / 100.0);
+            trace.line_segment(
+                [pos2(chart.left(), y), pos2(chart.right(), y)],
+                Stroke::new(1.0_f32, GRID),
+            );
+            painter.text(
+                pos2(chart.left() - 5.0, y),
+                Align2::RIGHT_CENTER,
+                format!("{percent}%"),
+                FontId::monospace(9.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+
+        let history = &app.history;
+        for watch in watches() {
+            draw_series(
+                &trace,
+                history,
+                &plot,
+                chart,
+                COLORS[watch.color % COLORS.len()],
+                None,
+                |f| watch.value(f).map(|value| value as f64),
+            );
+        }
+        paint_cursors(&trace, &plot, chart, history);
+        let hit = hit_cursor(&response, history, &plot, chart).or(axis_hit);
         if self.hover != hover {
             self.hover = hover;
             ui.ctx().request_repaint();
@@ -464,6 +659,100 @@ impl Timeline {
         if let Some((id, end)) = hit {
             app.history.select(id);
             self.past_end = Some((id, end));
+        }
+    }
+
+    pub fn events(&mut self, app: &mut Advanced, ui: &mut egui::Ui) {
+        ui.set_min_height(ui.available_height());
+        let mut hit = None;
+        ui.heading("事件");
+        egui::ScrollArea::vertical()
+            .id_salt("trace_events")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.spacing_mut().interact_size.y = 20.0;
+                let mut rows: Vec<_> = app
+                    .logs
+                    .iter()
+                    .map(|entry| (entry.time, entry.text.as_str(), entry.error, None))
+                    .chain(app.history.markers.iter().rev().take(100).map(|marker| {
+                        (
+                            app.session_started + marker.time,
+                            marker.text.as_str(),
+                            marker.alarm,
+                            Some(marker),
+                        )
+                    }))
+                    .collect();
+                rows.sort_by_key(|row| row.0);
+                if rows.is_empty() {
+                    ui.weak("暂无事件");
+                }
+                for (time, message, error, marker) in rows.into_iter().rev() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            vec2(82.0, 18.0),
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{time:.3} s",
+                                    time = time.as_secs_f64()
+                                ))
+                                .monospace()
+                                .weak(),
+                            ),
+                        );
+                        let (level, color) = if error {
+                            ("故障", FAULT)
+                        } else if marker.is_some() {
+                            ("状态", WARN)
+                        } else {
+                            ("信息", ui.visuals().weak_text_color())
+                        };
+                        ui.add_sized(
+                            vec2(36.0, 18.0),
+                            egui::Label::new(egui::RichText::new(level).color(color)),
+                        );
+                        if let Some(marker) = marker {
+                            let selected = app
+                                .history
+                                .cursor
+                                .as_ref()
+                                .is_some_and(|cursor| cursor.id == marker.id);
+                            let mut text =
+                                egui::RichText::new(format!("#{}  {message}", marker.id))
+                                    .color(color);
+                            if selected {
+                                text = text.background_color(ui.visuals().selection.bg_fill);
+                            }
+                            if ui
+                                .add(
+                                    egui::Label::new(text)
+                                        .wrap()
+                                        .selectable(false)
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                hit = Some((marker.id, marker.time.as_secs_f64()));
+                            }
+                        } else {
+                            let text = egui::RichText::new(message);
+                            ui.add(
+                                egui::Label::new(if error { text.color(color) } else { text })
+                                    .wrap(),
+                            );
+                        }
+                    });
+                }
+            });
+        if let Some((id, time)) = hit {
+            app.history.select(id);
+            if let Some(last) = app.history.frames.back() {
+                self.past_end = Some((id, (time + 1.5).min(last.time.as_secs_f64())));
+            }
         }
     }
 }
@@ -578,31 +867,20 @@ fn draw_axis(ui: &mut egui::Ui, history: &History, plot: &Plot) -> Option<(u64, 
     hit_cursor(&response, history, plot, chart)
 }
 
-fn draw_lane(
-    ui: &mut egui::Ui,
+fn normalized_y(chart: Rect, value: f64) -> f32 {
+    chart.bottom() - 3.0 - value as f32 * (chart.height() - 6.0).max(0.0)
+}
+
+fn draw_series(
+    trace: &egui::Painter,
     history: &History,
     plot: &Plot,
-    label: &str,
+    chart: Rect,
     color: Color32,
     baseline: Option<(f64, f64)>,
     value: impl Fn(&Recorded) -> Option<f64>,
-) -> Option<(u64, f64)> {
+) {
     let range = plot.range;
-    let (area, response) =
-        ui.allocate_exact_size(vec2(plot.width, 36.0), egui::Sense::click_and_drag());
-    let chart = plot.chart(area);
-    if !ui.is_rect_visible(area) || chart.width() <= 1.0 {
-        return None;
-    }
-    let painter = ui.painter();
-    painter.text(
-        pos2(area.left(), area.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(11.0),
-        color,
-    );
-    painter.rect_filled(chart, 2.0, ui.visuals().extreme_bg_color);
     let xpos = |t| plot.x(chart, t);
     let begin = history
         .frames
@@ -627,51 +905,28 @@ fn draw_lane(
         high += 0.5;
     }
     let span = high - low;
-    let y = |v: f64| chart.bottom() - 3.0 - ((v - low) / span) as f32 * (chart.height() - 6.0);
-    let trace = painter.with_clip_rect(chart.intersect(ui.clip_rect()));
-    for tick in plot.ticks() {
-        let x = xpos(tick);
-        trace.line_segment(
-            [pos2(x, chart.top()), pos2(x, chart.bottom())],
-            Stroke::new(1.0_f32, GRID),
-        );
+    let y = |v: f64| normalized_y(chart, (v - low) / span);
+    let stroke = Stroke::new(1.8_f32, color);
+    // Keep each pixel column's extrema and join successive available samples.
+    struct PixelColumn {
+        x: f32,
+        first: f64,
+        min: f64,
+        max: f64,
+        last: f64,
     }
-    for level in [low, (low + high) / 2.0, high] {
-        let yy = y(level);
-        trace.line_segment(
-            [pos2(chart.left(), yy), pos2(chart.right(), yy)],
-            Stroke::new(1.0_f32, GRID),
-        );
-    }
-    let format_tick = |value: f64| {
-        if value.abs() >= 10_000.0 {
-            format!("{value:.2e}")
-        } else if value.fract() == 0.0 {
-            format!("{value:.0}")
-        } else {
-            format!("{value:.2}")
-        }
-    };
-    for level in [low, high] {
-        painter.text(
-            pos2(chart.left() - 5.0, y(level)),
-            Align2::RIGHT_CENTER,
-            format_tick(level),
-            FontId::monospace(9.0),
-            ui.visuals().weak_text_color(),
-        );
-    }
-    let stroke = Stroke::new(1.2_f32, color);
-    // Keep each pixel column's extrema, and break at invalid samples.
-    let mut bucket: Option<(f32, f64, f64, f64)> = None;
+    let mut bucket = None;
     let mut prev = None;
-    let flush = |bucket: &mut Option<(f32, f64, f64, f64)>, prev: &mut Option<egui::Pos2>| {
-        if let Some((x, min, max, last)) = bucket.take() {
-            let point = pos2(x, y(last));
-            trace.line_segment([pos2(x, y(min)), pos2(x, y(max))], stroke);
+    let flush = |bucket: &mut Option<PixelColumn>, prev: &mut Option<egui::Pos2>| {
+        if let Some(column) = bucket.take() {
+            let x = column.x;
+            let point = pos2(x, y(column.last));
+            if column.min != column.max {
+                trace.line_segment([pos2(x, y(column.min)), pos2(x, y(column.max))], stroke);
+            }
             if let Some(before) = prev.replace(point) {
-                trace.line_segment([before, point], stroke);
-            } else if min == max {
+                trace.line_segment([before, pos2(x, y(column.first))], stroke);
+            } else if column.min == column.max {
                 trace.circle_filled(point, 1.0, color);
             }
         }
@@ -680,35 +935,31 @@ fn draw_lane(
     for frame in visible() {
         if last_id.is_some_and(|id| frame.id != id + 1) {
             flush(&mut bucket, &mut prev);
-            prev = None;
         }
         last_id = Some(frame.id);
         let Some(v) = value(frame) else {
             flush(&mut bucket, &mut prev);
-            prev = None;
             continue;
         };
         let x = xpos(frame.time.as_secs_f64()).floor();
-        if let Some((column, min, max, last)) = &mut bucket {
-            if *column == x {
-                *min = min.min(v);
-                *max = max.max(v);
-                *last = v;
+        if let Some(column) = &mut bucket {
+            if column.x == x {
+                column.min = column.min.min(v);
+                column.max = column.max.max(v);
+                column.last = v;
                 continue;
             }
         }
         flush(&mut bucket, &mut prev);
-        bucket = Some((x, v, v, v));
+        bucket = Some(PixelColumn {
+            x,
+            first: v,
+            min: v,
+            max: v,
+            last: v,
+        });
     }
     flush(&mut bucket, &mut prev);
-    paint_cursors(&trace, plot, chart, history);
-    if let Some(pos) = response.hover_pos().filter(|pos| chart.contains(*pos)) {
-        trace.line_segment(
-            [pos2(chart.left(), pos.y), pos2(chart.right(), pos.y)],
-            Stroke::new(1.0_f32, CROSSHAIR.gamma_multiply(0.55)),
-        );
-    }
-    hit_cursor(&response, history, plot, chart)
 }
 
 #[cfg(test)]
@@ -732,6 +983,7 @@ mod tests {
             width: 32,
             offset: 32,
         };
+        app.history.layout(std::slice::from_ref(&hpm));
         for source in [Source::Pdo, Source::Gpio, Source::Pdi] {
             app.add_watch(Key::entry(&hpm, source), Some(0), true);
         }
@@ -747,7 +999,6 @@ mod tests {
             valid: wkc != 0,
             wkc,
             expected: 3,
-            jitter_us: None,
             al: al.clone(),
         };
         for frame in [record(1, 3), record(2, 0), record(3, 3)] {
@@ -761,6 +1012,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
+                    egui::TopBottomPanel::bottom("test_events")
+                        .default_height(120.0)
+                        .show(ctx, |ui| timeline.events(app, ui));
                     egui::CentralPanel::default().show(ctx, |ui| {
                         timeline.show(app, ui);
                     });
@@ -768,7 +1022,20 @@ mod tests {
             )
         };
         let frame = render(&mut app, &mut timeline, vec![]);
-        for label in ["WKC", "00  6000:00", "00 GPIO", "00 PDI 相位 (µs)"] {
+        let pdo = app
+            .watches
+            .iter()
+            .find(|watch| watch.key.source == Source::Pdo)
+            .unwrap();
+        let color = COLORS[pdo.color % COLORS.len()];
+        assert!(
+            frame.shapes.iter().any(|item| {
+                matches!(&item.shape, egui::Shape::LineSegment { points, stroke }
+                if stroke.color == color && stroke.width >= 1.8 && points[1].x - points[0].x > 10.0)
+            }),
+            "valid samples on either side of an invalid cycle should be linked"
+        );
+        for label in ["00  6000:00", "00 GPIO", "00 PDI 相位 (µs)"] {
             assert!(
                 frame.shapes.iter().any(|item| {
                     matches!(&item.shape, egui::Shape::Text(text) if text.galley.text() == label)

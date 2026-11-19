@@ -84,9 +84,22 @@ pub struct Watch {
     pub color: usize,
     #[serde(skip)]
     pub id: Option<usize>,
+    #[serde(skip)]
+    pub automatic: bool,
 }
 
 impl Watch {
+    pub fn station_group(station: u32) -> String {
+        format!("从站 {station:02}")
+    }
+
+    pub fn is_default_mapping(&self) -> bool {
+        self.automatic
+            && !self.plotted
+            && self.display == Display::Hex
+            && self.group == Self::station_group(self.key.station)
+    }
+
     pub fn value(&self, frame: &Recorded) -> Option<u64> {
         if self.key.source == Source::Wkc {
             return u64::try_from(frame.wkc).ok();
@@ -133,7 +146,6 @@ impl Watch {
 pub struct Recorded {
     pub id: u64,
     pub time: Duration,
-    pub jitter_us: Option<f64>,
     pub values: Box<[Option<u64>]>,
     pub valid: bool,
     pub wkc: i32,
@@ -146,7 +158,6 @@ impl From<Cycle<'_>> for Recorded {
         Self {
             id: cycle.id,
             time: cycle.time,
-            jitter_us: cycle.jitter_us,
             values: cycle.values.into(),
             valid: cycle.valid,
             wkc: cycle.wkc,
@@ -236,8 +247,14 @@ impl History {
                         drive_state(word as u16),
                         DriveState::Fault | DriveState::Reaction
                     );
-                    if self.faults.insert(station, fault) != Some(fault) && fault {
-                        events.push((format!("从站 {station:02} · CiA402 故障"), true));
+                    match (self.faults.insert(station, fault), fault) {
+                        (None | Some(false), true) => {
+                            events.push((format!("从站 {station:02} · CiA402 故障"), true));
+                        }
+                        (Some(true), false) => {
+                            events.push((format!("从站 {station:02} · CiA402 故障已解除"), false));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -283,6 +300,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cia402_fault_and_recovery_are_logged_once_at_their_cycles() {
+        let mut history = History::default();
+        history.layout(&[Entry {
+            station: 1,
+            pdo: 0x1a00,
+            index: 0x6041,
+            sub: 0,
+            width: 16,
+            offset: 0,
+            output: false,
+        }]);
+        let al = Arc::new(Vec::new());
+        for (id, status) in [(1, 0x40), (2, 0x08), (3, 0x08), (4, 0x40)] {
+            history.push(Recorded {
+                id,
+                time: Duration::from_millis(id),
+                values: Box::new([Some(status)]),
+                valid: true,
+                wkc: 3,
+                expected: 3,
+                al: al.clone(),
+            });
+        }
+        assert_eq!(history.markers.len(), 2);
+        assert_eq!((history.markers[0].id, history.markers[0].alarm), (2, true));
+        assert_eq!(
+            (history.markers[1].id, history.markers[1].alarm),
+            (4, false)
+        );
+    }
+
+    #[test]
     fn wkc_marker_selects_exact_invalid_cycle_and_snapshot_stays_frozen() {
         let mut history = History::default();
         let al = Arc::new(Vec::new());
@@ -298,7 +347,6 @@ mod tests {
             wkc: if valid { 3 } else { 0 },
             expected: 3,
             al: al.clone(),
-            jitter_us: None,
         };
         history.push(sample(1, true));
         history.push(sample(2, false));

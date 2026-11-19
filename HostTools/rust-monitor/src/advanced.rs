@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, Frame, Margin};
+use eframe::egui::{self, Color32};
 use ethercat_monitor::{
     backend::{Backend, Session, Slave, Update},
     service::{
@@ -14,10 +14,11 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::trace::{Display, History, Key, Recorded, Source, Watch};
+use crate::trace_view::{Timeline, WatchEdit};
 use crate::{al_state, FAULT, GOOD, WARN};
 
 #[derive(Default)]
@@ -32,7 +33,7 @@ struct Sample {
 struct Updates {
     entries: Option<Vec<Entry>>,
     sample: Option<Sample>,
-    notice: Option<(String, bool)>,
+    notices: VecDeque<(String, bool)>,
     finished: Option<bool>,
     frames: VecDeque<Recorded>,
 }
@@ -62,6 +63,7 @@ impl Worker {
                 || worker_stop.load(Ordering::Relaxed),
                 |event| {
                     let mut updates = worker_updates.lock().unwrap();
+                    let rejected = matches!(&event, Event::Rejected(_));
                     match event {
                         Event::Layout(entries) => updates.entries = Some(entries),
                         Event::Sample {
@@ -77,8 +79,12 @@ impl Worker {
                                 expected,
                             });
                         }
-                        Event::Notice(text) => updates.notice = Some((text, false)),
-                        Event::Rejected(text) => updates.notice = Some((text, true)),
+                        Event::Notice(text) | Event::Rejected(text) => {
+                            if updates.notices.len() >= 100 {
+                                updates.notices.pop_front();
+                            }
+                            updates.notices.push_back((text, rejected));
+                        }
                     }
                     ctx.request_repaint();
                 },
@@ -96,7 +102,7 @@ impl Worker {
             );
             let mut updates = worker_updates.lock().unwrap();
             updates.finished = Some(result.is_ok());
-            updates.notice = Some(match result {
+            updates.notices.push_back(match result {
                 Ok(()) => ("PDO 会话已停止。".into(), false),
                 Err(error) => (error, true),
             });
@@ -130,12 +136,16 @@ impl Drop for Worker {
 
 type EsiStatus = (String, bool, bool);
 
+pub(super) struct BusLog {
+    pub time: Duration,
+    pub text: String,
+    pub error: bool,
+}
+
 pub(super) struct Advanced {
     pub(super) backend: Backend,
     adapters: crate::adapter_picker::AdapterPicker,
     pub(super) target: String,
-    confirmed: bool,
-    writes: bool,
     pub(super) cycle_us: u32,
     pub(super) dc: bool,
     pub(super) activation: String,
@@ -147,12 +157,12 @@ pub(super) struct Advanced {
     worker: Option<Worker>,
     entries: Vec<Entry>,
     sample: Sample,
-    value_changed_at: Vec<f64>,
-    bit_view: Option<usize>,
-    write_id: Option<usize>,
-    write_value: String,
+    pub(super) watch_edit: Option<WatchEdit>,
     mode: i8,
-    notice: Option<(String, bool)>,
+    pub(super) logs: VecDeque<BusLog>,
+    log_origin: Instant,
+    pub(super) session_started: Duration,
+    last_bus_state: Option<(bool, bool)>,
     esi_page: bool,
     xml: String,
     backup: String,
@@ -169,8 +179,6 @@ impl Default for Advanced {
             backend: Backend::Demo,
             adapters: crate::adapter_picker::AdapterPicker::default(),
             target: String::new(),
-            confirmed: false,
-            writes: false,
             cycle_us: 5000,
             dc: false,
             activation: "0x0300".into(),
@@ -182,12 +190,12 @@ impl Default for Advanced {
             worker: None,
             entries: Vec::new(),
             sample: Sample::default(),
-            value_changed_at: Vec::new(),
-            bit_view: None,
-            write_id: None,
-            write_value: "0".into(),
+            watch_edit: None,
             mode: 8,
-            notice: None,
+            logs: VecDeque::new(),
+            log_origin: Instant::now(),
+            session_started: Duration::ZERO,
+            last_bus_state: None,
             esi_page: false,
             xml: String::new(),
             backup: String::new(),
@@ -208,7 +216,7 @@ impl Drop for Advanced {
     }
 }
 
-fn number(text: &str) -> Option<u64> {
+pub(super) fn number(text: &str) -> Option<u64> {
     let text = text.trim();
     match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
@@ -253,20 +261,24 @@ impl Advanced {
             })
             .collect();
         self.selected = Some(0);
-        self.notice = Some(("演示扫描完成，发现 2 台模拟从站。".into(), false));
+        self.log("模拟总线 · 扫描完成，发现 2 台从站。".into(), false);
     }
 
     fn start(&mut self, options: Options, ctx: &egui::Context) {
         self.history = History::default();
-        for watch in &mut self.watches {
-            watch.id = None;
-        }
-        self.entries.clear();
-        self.bit_view = None;
-        self.value_changed_at.clear();
+        self.clear_layout();
         self.sample = Sample::default();
-        self.write_id = None;
-        self.notice = Some(("正在建立过程映像…".into(), false));
+        self.session_started = self.log_origin.elapsed();
+        self.last_bus_state = None;
+        let mode = if options.assign_activate == 0 {
+            "FreeRun"
+        } else {
+            "DC SYNC0"
+        };
+        self.log(
+            format!("{} · {mode} · 正在建立过程映像…", options.backend.label()),
+            false,
+        );
         self.worker = Some(Worker::start(options, ctx));
     }
 
@@ -284,16 +296,16 @@ impl Advanced {
                         {
                             self.selected = self.slaves.first().map(|s| s.position);
                         }
-                        self.notice = Some((
+                        self.log_changed(
                             format!("总线报告 {} 台从站 · {}", data.count, data.status),
                             false,
-                        ));
+                        );
                     }
                     Update::Error(error) => {
                         self.slaves.clear();
                         self.selected = None;
                         self.next_start = None;
-                        self.notice = Some((error, true));
+                        self.log(error, true);
                     }
                     Update::Stopped => stopped = true,
                     _ => {}
@@ -311,38 +323,25 @@ impl Advanced {
         }
         if let Some(worker) = &self.worker {
             let mut frames;
+            let layout;
+            let notices;
             let finished = {
                 let mut updates = worker.updates.lock().unwrap();
-                if let Some(entries) = updates.entries.take() {
-                    self.history.layout(&entries);
-                    for watch in &mut self.watches {
-                        watch.id = watch.key.bind(&entries);
-                    }
-                    self.entries = entries;
-                }
+                layout = updates.entries.take();
                 if let Some(sample) = updates.sample.take() {
-                    let now = ctx.input(|input| input.time);
-                    self.value_changed_at
-                        .resize(sample.values.len(), f64::NEG_INFINITY);
-                    for ((before, after), changed) in self
-                        .sample
-                        .values
-                        .iter()
-                        .zip(&sample.values)
-                        .zip(&mut self.value_changed_at)
-                    {
-                        if before.is_some() && after.is_some() && before != after {
-                            *changed = now;
-                        }
-                    }
                     self.sample = sample;
                 }
-                if let Some(notice) = updates.notice.take() {
-                    self.notice = Some(notice);
-                }
+                notices = std::mem::take(&mut updates.notices);
                 frames = std::mem::take(&mut updates.frames);
                 updates.finished
             };
+            for (text, error) in notices {
+                self.log(text, error);
+            }
+            if let Some(entries) = layout {
+                self.history.layout(&entries);
+                self.install_layout(entries);
+            }
             while let Some(frame) = frames.pop_front() {
                 self.history.push(frame);
             }
@@ -358,7 +357,7 @@ impl Advanced {
         }
         if let Some((_, status)) = &self.esi_job {
             let (text, error, done) = status.lock().unwrap().clone();
-            self.notice = Some((text, error));
+            self.log_changed(text, error);
             if done {
                 let (job, _) = self.esi_job.take().unwrap();
                 let _ = job.join();
@@ -377,7 +376,7 @@ impl Advanced {
         }
     }
 
-    fn writable(&self) -> bool {
+    pub(super) fn writable(&self) -> bool {
         self.history.cursor.is_none()
             && self.sample.valid
             && self
@@ -386,30 +385,39 @@ impl Advanced {
                 .is_some_and(|worker| worker.writable && !worker.stopping)
     }
 
+    pub(super) fn write_observed_output(&mut self, key: &Key, value: u64) {
+        if self.writable() && key.output && key.source == Source::Pdo {
+            if let Some(id) = key.bind(&self.entries) {
+                self.send(format!("set {id} {value}"));
+            }
+        }
+    }
+
     fn send(&mut self, command: String) {
         if let Some(worker) = &self.worker {
             if let Err(error) = worker.commands.try_send(command) {
-                self.notice = Some((format!("无法提交操作：{error}"), true));
+                self.log(format!("无法提交操作：{error}"), true);
             }
         }
     }
 
     pub(super) fn controls(&mut self, ui: &mut egui::Ui) {
         self.poll(ui.ctx());
-        let exclusive = self.target_valid() && (self.confirmed || self.backend == Backend::Demo);
+        self.log_bus_state();
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("连接设置", |ui| self.connection_settings(ui))
                 .response
                 .on_hover_text("选择主站、网卡和同步参数");
+            let target_valid = self.target_valid();
             if ui
                 .add_enabled(
-                    !self.busy() && exclusive,
+                    !self.busy() && target_valid,
                     egui::Button::new("扫描从站").min_size(egui::vec2(90.0, 31.0)),
                 )
+                .on_hover_text("扫描前请确保本工具独占 EtherCAT 总线。")
                 .clicked()
             {
-                self.entries.clear();
-                self.write_id = None;
+                self.clear_layout();
                 if self.backend == Backend::Demo {
                     self.demo_scan();
                 } else {
@@ -425,8 +433,8 @@ impl Advanced {
                     ));
                 }
             }
-            let config = self.options();
-            let can_start = exclusive
+            let config = self.options(true);
+            let can_start = target_valid
                 && !self.slaves.is_empty()
                 && self.worker.is_none()
                 && self.esi_job.is_none()
@@ -448,7 +456,11 @@ impl Advanced {
                         .fill(Color32::from_rgb(23, 76, 65))
                         .sense(egui::Sense::hover()),
                 );
-            } else if ui.add_enabled(can_start, start).clicked() {
+            } else if ui
+                .add_enabled(can_start, start)
+                .on_hover_text("操作前请确保本工具独占 EtherCAT 总线。")
+                .clicked()
+            {
                 let config = config.unwrap();
                 if self.scan.is_some() {
                     self.next_start = Some(config);
@@ -478,9 +490,6 @@ impl Advanced {
             if self.backend != Backend::Demo && !self.target.is_empty() {
                 ui.add(egui::Label::new("接口已选").sense(egui::Sense::hover()))
                     .on_hover_text(&self.target);
-                if !self.confirmed {
-                    ui.colored_label(WARN, "待确认独占");
-                }
             }
         });
     }
@@ -502,17 +511,12 @@ impl Advanced {
                 if self.backend == Backend::Soem {
                     self.adapters.refresh(ui.ctx());
                 }
-                self.confirmed = false;
-                self.writes = false;
+
                 self.slaves.clear();
-                self.entries.clear();
+                self.clear_layout();
                 self.selected = None;
-                self.write_id = None;
-                self.notice = None;
+
                 self.history = History::default();
-                for watch in &mut self.watches {
-                    watch.id = None;
-                }
             }
             let changed = match self.backend {
                 Backend::Igh => {
@@ -524,15 +528,11 @@ impl Advanced {
                 Backend::Demo => false,
             };
             if changed {
-                self.confirmed = false;
                 self.slaves.clear();
                 self.selected = None;
-                self.entries.clear();
-                self.write_id = None;
+                self.clear_layout();
+
                 self.history = History::default();
-                for watch in &mut self.watches {
-                    watch.id = None;
-                }
             }
         });
         ui.add_enabled_ui(
@@ -552,29 +552,44 @@ impl Advanced {
                     ui.label("AssignActivate");
                     ui.add(egui::TextEdit::singleline(&mut self.activation).desired_width(63.0));
                 }
-                ui.add(
-                    egui::DragValue::new(&mut self.cycle_us)
-                        .range(100..=20_000)
-                        .suffix(" µs"),
-                );
+                ui.horizontal(|ui| {
+                    ui.label("频率");
+                    let mut hz = 1_000_000.0 / f64::from(self.cycle_us);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut hz)
+                                .range(50.0..=10_000.0)
+                                .max_decimals(2)
+                                .update_while_editing(false)
+                                .suffix(" Hz"),
+                        )
+                        .changed()
+                    {
+                        self.cycle_us = (1_000_000.0 / hz).round() as u32;
+                    }
+                    egui::ComboBox::from_id_salt("frequency_presets")
+                        .selected_text("预设")
+                        .width(52.0)
+                        .show_ui(ui, |ui| {
+                            for preset in [50, 100, 200, 250, 500, 1000, 2000, 5000, 10_000] {
+                                ui.selectable_value(
+                                    &mut self.cycle_us,
+                                    1_000_000 / preset,
+                                    format!("{preset} Hz"),
+                                );
+                            }
+                        });
+                });
             },
         );
-        if self.backend != Backend::Demo {
-            ui.add_enabled_ui(!self.busy(), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.confirmed, "确认总线已停机且由本工具独占");
-                    ui.checkbox(&mut self.writes, "允许本次会话写入输出");
-                });
-            });
-        }
-
-        let exclusive = self.target_valid() && (self.confirmed || self.backend == Backend::Demo);
-        if let Some(config) = self.options() {
+        let target_valid = self.target_valid();
+        let writable = self.worker.as_ref().is_some_and(|worker| worker.writable);
+        if let Some(config) = self.options(writable) {
             if let Some(worker) = self.worker.as_mut() {
                 if worker.sync != (config.period_us, config.assign_activate)
                     && ui
                         .add_enabled(
-                            !worker.stopping && exclusive,
+                            !worker.stopping && target_valid,
                             egui::Button::new("应用并重连"),
                         )
                         .on_hover_text("停止当前会话并按新设置启动，输出将恢复为零。")
@@ -600,7 +615,7 @@ impl Advanced {
         self.scan_stopping = true;
     }
 
-    fn options(&self) -> Option<Options> {
+    fn options(&self, writable: bool) -> Option<Options> {
         let assign_activate = if self.dc {
             let value = u16::try_from(number(&self.activation)?).ok()?;
             if value & 0x0700 != 0x0300 || self.backend == Backend::Soem && value != 0x0300 {
@@ -615,7 +630,7 @@ impl Advanced {
             target: self.target.trim().into(),
             period_us: self.cycle_us,
             assign_activate,
-            writable: self.writes || self.backend == Backend::Demo,
+            writable,
         })
     }
 
@@ -632,8 +647,7 @@ impl Advanced {
                     .clicked()
                 {
                     self.selected = Some(slave.position);
-                    self.write_id = None;
-                    self.bit_view = None;
+
                     self.ask_burn = false;
                 }
                 let state = if self.worker.is_some() {
@@ -665,321 +679,146 @@ impl Advanced {
         }
     }
 
-    pub(super) fn central(&mut self, ui: &mut egui::Ui) {
-        ui.add_enabled_ui(!self.ask_burn, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.esi_page, false, "过程映像");
-                ui.selectable_value(&mut self.esi_page, true, "ESI 烧录");
-            })
-        });
-        ui.add_space(7.0);
-        egui::ScrollArea::both()
-            .id_salt("advanced_detail")
-            .show(ui, |ui| {
-                if self.esi_page {
-                    self.esi_panel(ui);
-                } else {
-                    self.process_panel(ui);
-                }
-            });
+    pub(super) fn esi_tab(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_enabled(
+                !self.ask_burn,
+                egui::Button::new("ESI 烧录").selected(self.esi_page),
+            )
+            .clicked()
+        {
+            self.esi_page = !self.esi_page;
+        }
     }
 
-    pub(super) fn status(&self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if self.backend == Backend::Demo {
-                ui.colored_label(GOOD, "模拟总线");
-            }
-            if let Some(worker) = &self.worker {
-                let (label, color) = if worker.stopping {
-                    ("正在释放主站", WARN)
-                } else if self.sample.valid {
-                    ("OP · 有效 PDO", GOOD)
-                } else {
-                    ("等待有效 PDO", WARN)
-                };
-                ui.colored_label(color, label);
-                ui.label(if worker.sync.1 == 0 {
-                    "FreeRun"
-                } else {
-                    "DC SYNC0"
-                });
-                ui.label(if self.sample.expected >= 0 {
-                    format!("WKC {} / {}", self.sample.wkc, self.sample.expected)
-                } else {
-                    format!("WKC {}", self.sample.wkc)
-                });
-            }
-            if let Some((notice, error)) = &self.notice {
-                ui.colored_label(
-                    if *error {
-                        FAULT
-                    } else {
-                        ui.visuals().text_color()
-                    },
-                    notice,
-                );
-            }
+    pub(super) fn central(&mut self, ui: &mut egui::Ui, timeline: &mut Timeline) {
+        if self.esi_page {
+            egui::ScrollArea::both()
+                .id_salt("advanced_detail")
+                .show(ui, |ui| self.esi_panel(ui));
+        } else {
+            self.process_controls(ui);
+            timeline.show(self, ui);
+        }
+    }
+
+    fn log(&mut self, text: String, error: bool) {
+        if self.logs.len() >= 100 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(BusLog {
+            time: self.log_origin.elapsed(),
+            text,
+            error,
         });
     }
 
-    fn process_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(station) = self.selected else {
-            ui.weak("先扫描总线，再选择从站。");
+    fn log_changed(&mut self, text: String, error: bool) {
+        if self
+            .logs
+            .back()
+            .is_none_or(|entry| entry.text != text || entry.error != error)
+        {
+            self.log(text, error);
+        }
+    }
+
+    fn log_bus_state(&mut self) {
+        let Some(worker) = &self.worker else {
+            self.last_bus_state = None;
             return;
         };
-        ui.horizontal(|ui| {
-            ui.heading("过程数据");
-            if self.backend == Backend::Demo
-                && self.worker.is_some()
-                && ui.button("模拟 WKC 归零").clicked()
-            {
-                self.send("demo wkc".into());
-            }
-        });
-        if self.entries.is_empty() {
-            ui.weak("启动 PDO 后显示从站的 RxPDO 和 TxPDO。");
+        let state = (worker.stopping, self.sample.valid);
+        if self.last_bus_state == Some(state) {
             return;
         }
-        let writable = self.writable();
-        let hpm = self
-            .slaves
-            .iter()
-            .any(|s| s.position == station && (s.vendor, s.product) == (0x00024121, 1));
-        let mut add = None;
-        let now = ui.input(|input| input.time);
-        egui::Grid::new("generic_pdos")
-            .spacing(egui::vec2(10.0, 3.0))
-            .show(ui, |ui| {
-                for label in ["", "PDO", "对象", "位域", "当前值", "操作"] {
-                    ui.weak(label);
-                }
-                ui.end_row();
-                for (row_number, (id, entry)) in self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.station == station)
-                    .enumerate()
-                {
-                    let background = ui.painter().add(egui::Shape::Noop);
-                    let value = self.sample.values.get(id).copied().flatten();
-                    let hex_width = usize::from(entry.width.min(64).div_ceil(4));
-                    let cells = [
-                        if entry.output {
-                            "Rx".into()
-                        } else {
-                            "Tx".into()
-                        },
-                        format!("0x{:04X}", entry.pdo),
-                        format!("0x{:04X}:{:02X}", entry.index, entry.sub),
-                        format!(
-                            "[{}:{}]",
-                            entry.offset + u32::from(entry.width).saturating_sub(1),
-                            entry.offset
-                        ),
-                        value.map_or("—".into(), |value| format!("0x{value:0hex_width$X}")),
-                    ];
-                    let mut responses = cells.into_iter().enumerate().map(|(column, cell)| {
-                        let mut label = egui::RichText::new(cell).monospace();
-                        if column == 4
-                            && self
-                                .value_changed_at
-                                .get(id)
-                                .is_some_and(|t| now - t < 0.18)
-                        {
-                            label = label.background_color(Color32::from_rgb(30, 58, 71));
-                        }
-                        ui.add(egui::Label::new(label).sense(egui::Sense::click()))
-                    });
-                    let row = responses.next().unwrap();
-                    let row = responses.fold(row, |left, right| left.union(right));
-                    let can_split = hpm
-                        && !entry.output
-                        && (entry.index, entry.sub, entry.width) == (0x6000, 0, 32);
-                    if entry.width <= 64 {
-                        row.context_menu(|ui| {
-                            for (label, source, plot) in [
-                                ("加入观察", Source::Pdo, false),
-                                ("加入波形", Source::Pdo, true),
-                                ("GPIO 加入波形", Source::Gpio, true),
-                                ("PDI 相位加入波形", Source::Pdi, true),
-                            ] {
-                                if source != Source::Pdo && !can_split {
-                                    continue;
-                                }
-                                if ui.button(label).clicked() {
-                                    add = Some((Key::entry(entry, source), Some(id), plot));
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    }
-                    let actions = ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        if entry.width > 64 {
-                            return;
-                        }
-                        let key = Key::entry(entry, Source::Pdo);
-                        let watched = self.watches.iter().find(|watch| watch.key == key);
-                        if ui
-                            .add(
-                                egui::Button::new("+观察")
-                                    .small()
-                                    .selected(watched.is_some()),
-                            )
-                            .on_hover_text("加入观察变量")
-                            .clicked()
-                        {
-                            add = Some((key.clone(), Some(id), false));
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new("+波形")
-                                    .small()
-                                    .selected(watched.is_some_and(|watch| watch.plotted)),
-                            )
-                            .on_hover_text("加入观察变量并显示在时间轴")
-                            .clicked()
-                        {
-                            add = Some((key, Some(id), true));
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new("位图")
-                                    .small()
-                                    .selected(self.bit_view == Some(id)),
-                            )
-                            .clicked()
-                        {
-                            self.bit_view = if self.bit_view == Some(id) {
-                                None
-                            } else {
-                                Some(id)
-                            };
-                        }
-                        if can_split {
-                            ui.menu_button("拆分", |ui| {
-                                for (label, source) in [
-                                    ("GPIO 加入波形", Source::Gpio),
-                                    ("PDI 相位加入波形", Source::Pdi),
-                                ] {
-                                    if ui.button(label).clicked() {
-                                        add = Some((Key::entry(entry, source), Some(id), true));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        }
-                        if entry.output
-                            && ui
-                                .add_enabled(
-                                    writable,
-                                    egui::Button::new("编辑")
-                                        .small()
-                                        .selected(self.write_id == Some(id)),
-                                )
-                                .clicked()
-                        {
-                            self.write_id = Some(id);
-                            self.write_value = value.unwrap_or(0).to_string();
-                        }
-                    });
-                    let rect = row
-                        .rect
-                        .union(actions.response.rect)
-                        .expand2(egui::vec2(4.0, 1.0));
-                    let hover = ui.rect_contains_pointer(rect);
-                    let fill = if hover {
-                        Color32::from_rgb(31, 48, 62)
-                    } else if row_number % 2 == 0 {
-                        Color32::from_rgb(17, 26, 36)
-                    } else {
-                        Color32::from_rgb(23, 34, 46)
-                    };
-                    ui.painter()
-                        .set(background, egui::Shape::rect_filled(rect, 2.0, fill));
-                    ui.end_row();
-                }
-            });
-        if let Some((key, id, plotted)) = add {
-            self.add_watch(key, id, plotted);
-        }
-        if let Some((id, entry)) = self
-            .bit_view
-            .and_then(|id| self.entries.get(id).map(|entry| (id, entry)))
-            .filter(|(_, entry)| entry.station == station)
+        self.last_bus_state = Some(state);
+        let label = match state {
+            (true, _) => "正在释放主站",
+            (false, true) => "OP · 有效 PDO",
+            (false, false) => "等待有效 PDO",
+        };
+        let wkc = if self.sample.expected >= 0 {
+            format!("WKC {} / {}", self.sample.wkc, self.sample.expected)
+        } else {
+            format!("WKC {}", self.sample.wkc)
+        };
+        self.log(format!("{label} · {wkc}"), false);
+    }
+
+    fn process_controls(&mut self, ui: &mut egui::Ui) {
+        if self.backend == Backend::Demo
+            && self.worker.is_some()
+            && ui.small_button("模拟 WKC 归零").clicked()
         {
-            ui.add_space(6.0);
-            ui.weak(format!(
-                "0x{:04X}:{:02X} · 位 {} → 0",
-                entry.index,
-                entry.sub,
-                entry.width.saturating_sub(1)
-            ));
-            let value = self.sample.values.get(id).copied().flatten();
-            for high in (0..entry.width.min(64))
-                .rev()
-                .collect::<Vec<_>>()
-                .chunks(16)
-            {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for &bit in high {
-                        let set = value.map(|value| value >> bit & 1);
-                        egui::Frame::new()
-                            .fill(if set == Some(1) {
-                                Color32::from_rgb(40, 63, 77)
-                            } else {
-                                Color32::from_rgb(23, 34, 46)
-                            })
-                            .inner_margin(egui::Margin::symmetric(5, 2))
-                            .show(ui, |ui| {
-                                ui.monospace(
-                                    set.map_or("—", |bit| if bit == 0 { "0" } else { "1" }),
-                                )
-                            })
-                            .response
-                            .on_hover_text(format!("位 {bit}"));
-                    }
-                });
+            self.send("demo wkc".into());
+        }
+        if let Some(station) = self.selected {
+            self.drive_panel(ui, station, self.writable());
+        }
+    }
+
+    fn clear_layout(&mut self) {
+        self.entries.clear();
+        self.watch_edit = None;
+        self.watches.retain(|watch| !watch.is_default_mapping());
+        for watch in &mut self.watches {
+            watch.id = None;
+        }
+    }
+
+    fn install_layout(&mut self, entries: Vec<Entry>) {
+        self.clear_layout();
+        for watch in &mut self.watches {
+            watch.id = watch.key.bind(&entries);
+        }
+        for (id, entry) in entries.iter().enumerate() {
+            let key = Key::entry(entry, Source::Pdo);
+            if !self.watches.iter().any(|watch| watch.key == key) {
+                self.push_watch(key, Some(id), false, true);
             }
         }
-        if let Some(id) = self.write_id {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("输出值");
-                ui.add(egui::TextEdit::singleline(&mut self.write_value).desired_width(120.0));
-                let value = number(&self.write_value);
-                if ui
-                    .add_enabled(writable && value.is_some(), egui::Button::new("写入 RxPDO"))
-                    .clicked()
-                {
-                    self.send(format!("set {id} {}", value.unwrap()));
-                }
-            });
-        }
-        self.drive_panel(ui, station, writable);
+        self.entries = entries;
+    }
+
+    pub(super) fn can_split(&self, key: &Key) -> bool {
+        key.source == Source::Pdo
+            && !key.output
+            && (key.index, key.sub, key.width) == (0x6000, 0, 32)
+            && self.slaves.iter().any(|slave| {
+                slave.position == key.station && (slave.vendor, slave.product) == (0x00024121, 1)
+            })
     }
 
     pub(super) fn add_watch(&mut self, key: Key, id: Option<usize>, plotted: bool) {
         if let Some(watch) = self.watches.iter_mut().find(|watch| watch.key == key) {
             watch.plotted |= plotted;
             watch.id = id;
-        } else if self.watches.len() < 256 {
-            let display = if matches!(key.source, Source::Wkc | Source::Pdi) {
-                Display::Decimal
-            } else {
-                Display::Hex
-            };
-            self.watches.push(Watch {
-                key,
-                id,
-                plotted,
-                display,
-                group: "默认".into(),
-                color: self.watches.len() % 8,
-            });
+        } else {
+            self.push_watch(key, id, plotted, false);
         }
+    }
+
+    fn push_watch(&mut self, key: Key, id: Option<usize>, plotted: bool, automatic: bool) {
+        let display = if matches!(key.source, Source::Wkc | Source::Pdi) {
+            Display::Decimal
+        } else {
+            Display::Hex
+        };
+        let group = if automatic {
+            Watch::station_group(key.station)
+        } else {
+            "默认".into()
+        };
+        self.watches.push(Watch {
+            key,
+            id,
+            plotted,
+            display,
+            group,
+            color: self.watches.len() % 8,
+            automatic,
+        });
     }
 
     fn drive_panel(&mut self, ui: &mut egui::Ui, station: u32, writable: bool) {
@@ -1005,80 +844,59 @@ impl Advanced {
             .map(|mode| mode as i8);
         let can_set_mode =
             find(0x6060, true, 8).is_some() && state.is_some_and(|v| v != DriveState::Enabled);
-        ui.add_space(12.0);
-        Frame::group(ui.style())
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.heading("CiA402 驱动控制");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("驱动状态");
-                    ui.colored_label(
-                        if state == Some(DriveState::Fault) {
-                            FAULT
-                        } else {
-                            GOOD
-                        },
-                        state.map_or("—", drive_label),
-                    );
-                    ui.label(
-                        feedback
-                            .map_or("模式反馈 —".into(), |mode| format!("模式反馈 {mode}")),
-                    );
-                });
-                ui.horizontal_wrapped(|ui| {
-                    for (label, command, allowed) in [
-                        (
-                            "一键使能",
-                            "enable",
-                            matches!(
-                                state,
-                                Some(
-                                    DriveState::Disabled
-                                        | DriveState::Ready
-                                        | DriveState::SwitchedOn
-                                )
-                            ),
+        egui::CollapsingHeader::new("CiA402 驱动控制").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("驱动状态");
+                ui.colored_label(
+                    if state == Some(DriveState::Fault) {
+                        FAULT
+                    } else {
+                        GOOD
+                    },
+                    state.map_or("—", drive_label),
+                );
+                ui.label(feedback.map_or("模式反馈 —".into(), |mode| format!("模式反馈 {mode}")));
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (label, command, allowed) in [
+                    (
+                        "一键使能",
+                        "enable",
+                        matches!(
+                            state,
+                            Some(DriveState::Disabled | DriveState::Ready | DriveState::SwitchedOn)
                         ),
-                        ("故障复位", "reset", state == Some(DriveState::Fault)),
-                        ("快速停止", "stop", state.is_some()),
-                        ("禁止电压", "disable", state.is_some()),
-                    ] {
-                        if ui
-                            .add_enabled(writable && allowed, egui::Button::new(label))
-                            .clicked()
-                        {
-                            self.send(format!("drive {station} {command}"));
-                        }
-                    }
-                    if self.backend == Backend::Demo
-                        && ui
-                            .add_enabled(writable, egui::Button::new("模拟故障"))
-                            .clicked()
-                    {
-                        self.send("demo fault".into());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("运行模式");
-                    ui.add(egui::DragValue::new(&mut self.mode));
+                    ),
+                    ("故障复位", "reset", state == Some(DriveState::Fault)),
+                    ("快速停止", "stop", state.is_some()),
+                    ("禁止电压", "disable", state.is_some()),
+                ] {
                     if ui
-                        .add_enabled(writable && can_set_mode, egui::Button::new("设置模式"))
+                        .add_enabled(writable && allowed, egui::Button::new(label))
                         .clicked()
                     {
-                        self.send(format!("drive {station} mode {}", self.mode));
+                        self.send(format!("drive {station} {command}"));
                     }
-                });
+                }
+                if self.backend == Backend::Demo
+                    && ui
+                        .add_enabled(writable, egui::Button::new("模拟故障"))
+                        .clicked()
+                {
+                    self.send("demo fault".into());
+                }
             });
-    }
-
-    pub(super) fn fault_indices(&self) -> Vec<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(id, e)| {
-                (!e.output && e.index == 0x6041 && e.sub == 0 && e.width == 16).then_some(id)
-            })
-            .collect()
+            ui.horizontal(|ui| {
+                ui.label("运行模式");
+                ui.add(egui::DragValue::new(&mut self.mode));
+                if ui
+                    .add_enabled(writable && can_set_mode, egui::Button::new("设置模式"))
+                    .clicked()
+                {
+                    self.send(format!("drive {station} mode {}", self.mode));
+                }
+            });
+        });
     }
 
     fn esi_panel(&mut self, ui: &mut egui::Ui) {
@@ -1088,7 +906,7 @@ impl Advanced {
             ui.horizontal(|ui| {
                 for (caption, write) in [("预览变更", false), ("模拟烧录", true)] {
                     if ui.button(caption).clicked() {
-                        self.notice = Some(match esi::demo_update(&mut self.demo_sii, write) {
+                        let (text, error) = match esi::demo_update(&mut self.demo_sii, write) {
                             Ok(words) => (
                                 if write {
                                     format!("模拟烧录并校验完成，更新 {words} 字。")
@@ -1098,30 +916,30 @@ impl Advanced {
                                 false,
                             ),
                             Err(error) => (error, true),
-                        });
+                        };
+                        self.log(text, error);
                     }
                 }
             });
             return;
         }
         ui.heading("更新从站 EEPROM");
-        let Some(position) = self.selected.and_then(|v| u16::try_from(v).ok()) else {
+        let position = self.selected.and_then(|v| u16::try_from(v).ok());
+        if let Some(position) = position {
+            ui.label(format!("目标从站 {position}"));
+        } else {
             ui.weak("先扫描并选择目标从站。");
-            return;
-        };
-        ui.label(format!("目标从站 {position}"));
+        }
         ui.weak("先停止扫描和 PDO。每次操作使用新的备份路径。");
         ui.add_enabled_ui(self.esi_job.is_none() && !self.ask_burn, |ui| {
-            for (label, value) in [
-                ("ESI XML 路径", &mut self.xml),
-                ("SII 备份路径", &mut self.backup),
-            ] {
-                ui.label(label);
-                ui.add(egui::TextEdit::singleline(value).desired_width(400.0));
-            }
+            esi_path(ui, "ESI XML 路径", &mut self.xml, false);
+            esi_path(ui, "SII 备份路径", &mut self.backup, true);
         });
-        let ready = self.confirmed
-            && self.target_valid()
+        let Some(position) = position else {
+            return;
+        };
+        let ready = self.target_valid()
+            && self.next_start.is_none()
             && self.scan.is_none()
             && self.worker.is_none()
             && self.esi_job.is_none()
@@ -1131,6 +949,7 @@ impl Advanced {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(ready, egui::Button::new("预览并备份"))
+                .on_hover_text("操作前请确保本工具独占 EtherCAT 总线。")
                 .clicked()
             {
                 self.start_esi(position, false, ui.ctx());
@@ -1149,7 +968,7 @@ impl Advanced {
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label(format!("将从站 {position} 的 PDO 类别写入 EEPROM。"));
-                    ui.label("核对目标和备份路径后继续。");
+                    ui.label("确保本工具独占总线，并核对目标和备份路径。");
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
                             action = Some(false);
@@ -1200,6 +1019,48 @@ impl Advanced {
     }
 }
 
+fn esi_path(ui: &mut egui::Ui, label: &str, value: &mut String, backup: bool) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(360.0)
+                .background_color(ui.visuals().panel_fill)
+                .hint_text(if backup {
+                    "选择新的备份文件"
+                } else {
+                    "选择本机 XML 文件"
+                }),
+        );
+        if ui
+            .button(if backup { "另存为…" } else { "浏览…" })
+            .clicked()
+        {
+            let dialog = if backup {
+                rfd::FileDialog::new()
+                    .set_title("选择新的 SII 备份路径")
+                    .add_filter("SII 备份", &["sii"])
+                    .set_file_name("backup.sii")
+            } else {
+                rfd::FileDialog::new()
+                    .set_title("选择 ESI XML 文件")
+                    .add_filter("ESI XML", &["xml"])
+            };
+            let path = if backup {
+                dialog.save_file()
+            } else {
+                dialog.pick_file()
+            };
+            if let Some(mut path) = path {
+                if backup && path.extension().is_none() {
+                    path.set_extension("sii");
+                }
+                *value = path.to_string_lossy().into_owned();
+            }
+        }
+    });
+}
+
 fn drive_label(state: DriveState) -> &'static str {
     match state {
         DriveState::NotReady => "未就绪",
@@ -1217,23 +1078,12 @@ fn drive_label(state: DriveState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{Event as Input, PointerButton, Pos2, RawInput, Rect, Vec2};
-
-    fn location(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
-        output.shapes.iter().find_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) if text.galley.text() == label => {
-                Some(text.pos + text.galley.rect.center().to_vec2())
-            }
-            _ => None,
-        })
-    }
 
     #[test]
-    fn pdo_waveform_has_visible_shortcut_and_context_menu() {
-        let ctx = egui::Context::default();
+    fn mapped_pdos_appear_in_the_sidebar_and_keep_waveform_settings() {
         let mut app = Advanced::default();
         app.demo_scan();
-        app.entries.push(Entry {
+        let entry = Entry {
             station: 0,
             pdo: 0x1a00,
             index: 0x6000,
@@ -1241,58 +1091,22 @@ mod tests {
             width: 32,
             offset: 0,
             output: false,
-        });
-        let draw = |app: &mut Advanced, events| {
-            ctx.run(
-                RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
-                    events,
-                    ..RawInput::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| app.process_panel(ui));
-                },
-            )
         };
-        let click = |app: &mut Advanced, pos, button| {
-            draw(
-                app,
-                vec![
-                    Input::PointerMoved(pos),
-                    Input::PointerButton {
-                        pos,
-                        button,
-                        pressed: true,
-                        modifiers: Default::default(),
-                    },
-                ],
-            );
-            draw(
-                app,
-                vec![Input::PointerButton {
-                    pos,
-                    button,
-                    pressed: false,
-                    modifiers: Default::default(),
-                }],
-            )
-        };
-        let row = location(&draw(&mut app, vec![]), "0x6000:00").unwrap();
-        let output = click(&mut app, row, PointerButton::Secondary);
-        let menu = location(&output, "加入波形")
-            .or_else(|| location(&draw(&mut app, vec![]), "加入波形"))
-            .expect("secondary click should open the PDO menu");
-        click(&mut app, menu, PointerButton::Primary);
-        assert_eq!(app.watches.len(), 1);
-        assert_eq!(app.watches[0].key.index, 0x6000);
-        assert!(app.watches[0].plotted);
+        let key = Key::entry(&entry, Source::Pdo);
+        app.install_layout(vec![entry.clone()]);
 
-        app.watches.clear();
-        let shortcut = location(&draw(&mut app, vec![]), "+波形")
-            .expect("waveform action is visible before hovering or opening a menu");
-        click(&mut app, shortcut, PointerButton::Primary);
         assert_eq!(app.watches.len(), 1);
-        assert_eq!(app.watches[0].key.index, 0x6000);
+        assert_eq!(app.watches[0].key, key);
+        assert_eq!(app.watches[0].id, Some(0));
+        assert!(app.can_split(&key));
+        assert!(app.watches[0].is_default_mapping());
+
+        app.add_watch(key.clone(), Some(0), true);
+        app.install_layout(vec![entry]);
+
+        assert_eq!(app.watches.len(), 1);
+        assert_eq!(app.watches[0].key, key);
         assert!(app.watches[0].plotted);
+        assert!(!app.watches[0].is_default_mapping());
     }
 }
