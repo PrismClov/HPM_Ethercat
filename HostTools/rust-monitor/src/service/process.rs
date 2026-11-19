@@ -2,7 +2,7 @@
 //! Rust port of SimpleCAT's process-variable and CiA402 command handling.
 //! Upstream: tc3_scan.c and ui/ui_master.c at 7bf6be13.
 use super::{helper, number, Result};
-use ethercat_monitor::backend::Backend;
+use crate::backend::Backend;
 use std::{
     io::{self, BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -83,19 +83,20 @@ impl Drop for Wire {
     }
 }
 
-#[derive(Debug)]
-struct Entry {
-    station: u32,
-    output: bool,
-    pdo: u16,
-    index: u16,
-    sub: u8,
-    width: u8,
-    offset: u32,
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub station: u32,
+    pub output: bool,
+    pub pdo: u16,
+    pub index: u16,
+    pub sub: u8,
+    pub width: u8,
+    pub offset: u32,
 }
 
 struct Image {
-    wire: Wire,
+    wire: Option<Wire>,
+    simulated_since: Instant,
     entries: Vec<Entry>,
     values: Vec<Option<u64>>,
     valid: bool,
@@ -111,6 +112,66 @@ fn parse<T: std::str::FromStr>(value: &str) -> Result<T> {
 }
 
 impl Image {
+    fn demo() -> Self {
+        let entries = [
+            (0, true, 0x7010, 32, 0),
+            (0, false, 0x6000, 32, 32),
+            (1, true, 0x6040, 16, 64),
+            (1, false, 0x6041, 16, 80),
+            (1, true, 0x6060, 8, 96),
+            (1, false, 0x6061, 8, 104),
+        ]
+        .into_iter()
+        .map(|(station, output, index, width, offset)| Entry {
+            station,
+            output,
+            pdo: if output { 0x1600 } else { 0x1a00 },
+            index,
+            sub: 0,
+            width,
+            offset,
+        })
+        .collect();
+        Self {
+            wire: None,
+            simulated_since: Instant::now(),
+            entries,
+            values: vec![Some(0), Some(0), Some(0), Some(0x40), Some(8), Some(8)],
+            valid: true,
+            wkc: 6,
+            expected: 6,
+            dc_time_ns: None,
+        }
+    }
+
+    fn simulate(&mut self, command: &str) -> Result<()> {
+        let fields: Vec<_> = command.split_whitespace().collect();
+        if let ["W", id, value] = fields.as_slice() {
+            let id = parse::<usize>(id)?;
+            let value = parse::<u64>(value)?;
+            self.write_command(id, value)?;
+            self.values[id] = Some(value);
+            if id == 2 {
+                self.values[3] = Some(match (value, self.values[3]) {
+                    (0x80, Some(8)) => 0x40,
+                    (6, Some(0x40)) => 0x21,
+                    (7, Some(0x21 | 0x27)) => 0x23,
+                    (15, Some(0x23)) => 0x27,
+                    (2, _) => 7,
+                    (0, Some(8)) => 8,
+                    (0, _) => 0x40,
+                    (_, status) => status.unwrap_or(0),
+                });
+            } else if id == 4 {
+                self.values[5] = Some(value);
+            }
+        }
+        let ticks = self.simulated_since.elapsed().as_millis() as u64 / 200;
+        self.values[1] =
+            Some(((ticks % 20) << 16) | ((ticks ^ self.values[0].unwrap_or(0)) & 0xffff));
+        Ok(())
+    }
+
     fn open(mut wire: Wire) -> Result<Self> {
         let mut entries = Vec::new();
         wire.response(|row| {
@@ -140,7 +201,8 @@ impl Image {
         }
         let values = vec![None; entries.len()];
         Ok(Self {
-            wire,
+            wire: Some(wire),
+            simulated_since: Instant::now(),
             entries,
             values,
             valid: false,
@@ -151,11 +213,14 @@ impl Image {
     }
 
     fn cycle(&mut self, command: &str) -> Result<()> {
-        self.wire.send(command)?;
+        let Some(wire) = &mut self.wire else {
+            return self.simulate(command);
+        };
+        wire.send(command)?;
         self.valid = false;
         self.values.fill(None);
         self.dc_time_ns = None;
-        self.wire.response(|row| {
+        wire.response(|row| {
             match row {
                 ["cycle", valid, wkc, expected] => {
                     self.valid = *valid == "1";
@@ -203,25 +268,29 @@ impl Image {
         Ok(format!("W {id} {value}"))
     }
 
-    fn print_layout(&self) {
-        println!("ID\tStation\tDirection\tPDO\tObject\tBits\tIOmap bit");
-        for (id, e) in self.entries.iter().enumerate() {
-            println!(
-                "{id}\t{}\t{}\t{:04X}\t{:04X}:{:02X}\t{}\t{}",
-                e.station,
-                if e.output { "Rx" } else { "Tx" },
-                e.pdo,
-                e.index,
-                e.sub,
-                e.width,
-                e.offset
-            );
-        }
+    fn finish(self) -> Result<()> {
+        self.wire.map_or(Ok(()), Wire::finish)
+    }
+}
+
+fn print_layout(entries: &[Entry]) {
+    println!("ID\tStation\tDirection\tPDO\tObject\tBits\tIOmap bit");
+    for (id, e) in entries.iter().enumerate() {
+        println!(
+            "{id}\t{}\t{}\t{:04X}\t{:04X}:{:02X}\t{}\t{}",
+            e.station,
+            if e.output { "Rx" } else { "Tx" },
+            e.pdo,
+            e.index,
+            e.sub,
+            e.width,
+            e.offset
+        );
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DriveState {
+pub enum DriveState {
     NotReady,
     Disabled,
     Ready,
@@ -233,7 +302,7 @@ enum DriveState {
     Unknown,
 }
 
-fn drive_state(word: u16) -> DriveState {
+pub fn drive_state(word: u16) -> DriveState {
     match (word & 0x004f, word & 0x006f) {
         (0x0000, _) => DriveState::NotReady,
         (0x0040, _) => DriveState::Disabled,
@@ -319,16 +388,28 @@ impl DriveJob {
     }
 }
 
+#[derive(Clone)]
+pub struct Options {
+    pub backend: Backend,
+    pub target: String,
+    pub period_us: u32,
+    pub assign_activate: u16,
+    pub writable: bool,
+}
+
+pub enum Event {
+    Layout(Vec<Entry>),
+    Sample {
+        values: Vec<Option<u64>>,
+        valid: bool,
+        wkc: i32,
+        expected: i32,
+    },
+    Notice(String),
+    Rejected(String),
+}
+
 pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bool) -> Result<()> {
-    let ns = (us * 1000).to_string();
-    let dc = dc.to_string();
-    let mut image = Image::open(Wire::open(helper(backend)?.args([
-        target,
-        "--process",
-        &ns,
-        &dc,
-    ]))?)?;
-    image.print_layout();
     println!("Commands: list | read ID | set ID VALUE | drive STATION status|enable|reset|disable|stop|mode CODE | quit");
     let (tx, rx) = mpsc::sync_channel(16);
     thread::spawn(move || {
@@ -342,12 +423,61 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
             }
         }
     });
+    serve(
+        Options {
+            backend,
+            target: target.into(),
+            period_us: us,
+            assign_activate: dc,
+            writable,
+        },
+        rx,
+        || false,
+        |event| match event {
+            Event::Layout(entries) => print_layout(&entries),
+            Event::Notice(text) => println!("{text}"),
+            Event::Rejected(text) => eprintln!("{text}"),
+            Event::Sample { .. } => {}
+        },
+    )
+}
+
+pub fn serve(
+    options: Options,
+    rx: mpsc::Receiver<String>,
+    stop: impl Fn() -> bool,
+    mut notify: impl FnMut(Event),
+) -> Result<()> {
+    let Options {
+        backend,
+        target,
+        period_us: us,
+        assign_activate,
+        writable,
+    } = options;
+    if !(100..=20_000).contains(&us) {
+        return Err("Period must be 100–20000 µs.".into());
+    }
+    let ns = (us * 1000).to_string();
+    let dc = assign_activate.to_string();
+    let mut image = if backend == Backend::Demo {
+        Image::demo()
+    } else {
+        Image::open(Wire::open(helper(backend)?.args([
+            &target,
+            "--process",
+            &ns,
+            &dc,
+        ]))?)?
+    };
+    notify(Event::Layout(image.entries.clone()));
     let period = Duration::from_micros(u64::from(us));
     let mut due = Instant::now();
     let mut status_at = due;
     let mut job = None::<DriveJob>;
     let mut dc_integral = 0;
     let mut ready = false;
+    let mut publish_at = due;
     loop {
         while Instant::now() < due {
             let remaining = due.saturating_duration_since(Instant::now());
@@ -357,18 +487,21 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
                 std::hint::spin_loop();
             }
         }
+        if stop() {
+            return image.finish();
+        }
         let now = Instant::now();
         let request = match rx.try_recv() {
-            Ok(line) if line.trim() == "quit" => return image.wire.finish(),
+            Ok(line) if line.trim() == "quit" => return image.finish(),
             Ok(line) => Some(line),
-            Err(mpsc::TryRecvError::Disconnected) => return image.wire.finish(),
+            Err(mpsc::TryRecvError::Disconnected) => return image.finish(),
             Err(mpsc::TryRecvError::Empty) => None,
         };
         let mut write = None;
         if let Some(line) = request {
-            match execute(&image, &line, &mut job, writable, now) {
+            match execute(&mut image, &line, &mut job, writable, now, &mut notify) {
                 Ok(command) => write = command,
-                Err(error) => eprintln!("{error}"),
+                Err(error) => notify(Event::Rejected(error)),
             }
         }
         if let Some(active) = &mut job {
@@ -377,7 +510,7 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
                     write = command;
                     if done {
                         job = None;
-                        println!("CiA402 sequence complete.");
+                        notify(Event::Notice("CiA402 序列完成。".into()));
                     }
                 }
                 // End this output session rather than retaining a partially advanced control word.
@@ -392,14 +525,22 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
         if write.is_some() && !image.valid {
             return Err("Output cycle did not receive valid PDO acknowledgement.".into());
         }
-        if image.valid && !ready {
-            ready = true;
-            if image.expected >= 0 {
-                println!("PDO ready (OP; WKC {}/{}).", image.wkc, image.expected);
-            } else {
-                println!("PDO ready (OP; WKC {}).", image.wkc);
-            }
+        if write.is_some() {
+            notify(Event::Notice("输出已发送，PDO 周期有效。".into()));
         }
+        if image.valid && !ready {
+            notify(Event::Notice(format!("PDO 已进入 OP，WKC {}。", image.wkc)));
+        }
+        if now >= publish_at || write.is_some() || ready != image.valid {
+            publish_at = now + Duration::from_millis(40);
+            notify(Event::Sample {
+                values: image.values.clone(),
+                valid: image.valid,
+                wkc: image.wkc,
+                expected: image.expected,
+            });
+        }
+        ready = image.valid;
         let adjusted_period = if let Some(reference) = image.dc_time_ns {
             let ns = i64::from(us) * 1000;
             // Schedule SOEM sends relative to the distributed reference clock.
@@ -422,11 +563,12 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
 }
 
 fn execute(
-    image: &Image,
+    image: &mut Image,
     line: &str,
     job: &mut Option<DriveJob>,
     writable: bool,
     now: Instant,
+    notify: &mut impl FnMut(Event),
 ) -> Result<Option<String>> {
     let fields: Vec<_> = line.split_whitespace().collect();
     let id = |value: &str| {
@@ -436,10 +578,17 @@ fn execute(
     };
     match fields.as_slice() {
         [] => {}
-        ["list"] => image.print_layout(),
+        ["list"] => notify(Event::Layout(image.entries.clone())),
+        ["demo", "fault"] if image.wire.is_none() => {
+            job.take();
+            image.values[3] = Some(8);
+        }
         ["read", key] => {
             let value = image.values.get(id(key)?).ok_or("Unknown variable ID.")?;
-            println!("{key} = {value:?}   WKC {}/{}", image.wkc, image.expected);
+            notify(Event::Notice(format!(
+                "{key} = {value:?}   WKC {}/{}",
+                image.wkc, image.expected
+            )));
         }
         ["set", key, value] if writable && job.is_none() => {
             return image
@@ -460,7 +609,7 @@ fn execute(
                     .ok()
                     .and_then(|id| image.values[id])
                     .map(|v| v as i8);
-                println!("{state:?}   mode {mode:?}");
+                notify(Event::Notice(format!("{state:?}   mode {mode:?}")));
                 return Ok(None);
             }
             if !writable {
@@ -512,6 +661,31 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulated_drive_follows_the_shared_cia402_sequence() {
+        let mut image = Image::demo();
+        let now = Instant::now();
+        let mut job = DriveJob {
+            control: image.lookup(1, 0x6040, true, 16).unwrap(),
+            status: image.lookup(1, 0x6041, false, 16).unwrap(),
+            deadline: now + Duration::from_secs(3),
+            action: DriveAction::Enable { written: None },
+        };
+        for control in [6, 7, 15] {
+            let (done, command) = job.next(&image, now).unwrap();
+            assert!(!done);
+            let command = command.unwrap();
+            assert_eq!(command, format!("W 2 {control}"));
+            image.cycle(&command).unwrap();
+        }
+        assert_eq!(job.next(&image, now).unwrap(), (true, None));
+        image.cycle("W 2 2").unwrap();
+        assert_eq!(
+            drive_state(image.values[3].unwrap() as u16),
+            DriveState::QuickStop
+        );
+    }
 
     #[test]
     fn enable_is_driven_by_statusword_and_rejects_fault_or_quick_stop() {

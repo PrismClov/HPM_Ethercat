@@ -46,9 +46,20 @@ impl Monitor {
                     .inner_margin(Margin::symmetric(20, 12)),
             )
             .show(ctx, |ui| {
-                ui.heading(RichText::new("EtherCAT 工作台").size(23.0).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(RichText::new("EtherCAT 工作台").size(23.0).strong());
+                    ui.add_space(10.0);
+                    ui.add_enabled_ui(self.session.is_none() && !self.advanced.busy(), |ui| {
+                        ui.selectable_value(&mut self.show_advanced, true, "通用调试");
+                        ui.selectable_value(&mut self.show_advanced, false, "HPM 实时波形");
+                    });
+                });
                 ui.add_space(3.0);
-                self.controls(ui);
+                if self.show_advanced {
+                    self.advanced.controls(ui);
+                } else {
+                    self.controls(ui);
+                }
             });
 
         egui::TopBottomPanel::bottom("bus_status")
@@ -59,7 +70,11 @@ impl Monitor {
                     .inner_margin(Margin::symmetric(20, 6)),
             )
             .show(ctx, |ui| {
-                self.overview(ui);
+                if self.show_advanced {
+                    self.advanced.status(ui);
+                } else {
+                    self.overview(ui);
+                }
             });
 
         egui::SidePanel::left("slave_inspector")
@@ -73,7 +88,13 @@ impl Monitor {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector")
-                    .show(ui, |ui| self.inspector(ui));
+                    .show(ui, |ui| {
+                        if self.show_advanced {
+                            self.advanced.sidebar(ui);
+                        } else {
+                            self.inspector(ui);
+                        }
+                    });
             });
 
         egui::CentralPanel::default()
@@ -83,6 +104,10 @@ impl Monitor {
                     .inner_margin(Margin::symmetric(20, 15)),
             )
             .show(ctx, |ui| {
+                if self.show_advanced {
+                    self.advanced.central(ui);
+                    return;
+                }
                 ui.heading(if self.pdo_enabled {
                     "实时波形"
                 } else {

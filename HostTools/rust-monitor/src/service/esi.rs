@@ -2,7 +2,7 @@
 //! Rust port of the PDO-category preparation and verified burn workflow in
 //! SimpleCAT src/esi_flash.c and src/tc3_scan.c (7bf6be13).
 use super::{helper, number, process::Wire, Result};
-use ethercat_monitor::backend::Backend;
+use crate::backend::Backend;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -518,6 +518,20 @@ pub(super) fn run(
     backup: &str,
     write: bool,
 ) -> Result<()> {
+    run_with_progress(backend, target, position, xml, backup, write, |line| {
+        println!("{line}")
+    })
+}
+
+pub fn run_with_progress(
+    backend: Backend,
+    target: &str,
+    position: u16,
+    xml: &str,
+    backup: &str,
+    write: bool,
+    mut progress: impl FnMut(String),
+) -> Result<()> {
     let xml = read_esi(xml)?;
     if backend == Backend::Igh {
         let position = position.to_string();
@@ -525,12 +539,12 @@ pub(super) fn run(
         let original = igh_dump(target, &position)?;
         let image = build(&xml, &original)?;
         save_backup(backup, &original)?;
-        println!("{} SII words prepared, backup {}", image.len(), backup);
+        progress(format!("已生成 {} 字 SII，备份 {}", image.len(), backup));
         if write && !original.starts_with(&image) {
             igh_burn(target, &position, &original, &image)?;
-            println!("IgH SII write verified after rescan.");
+            progress("IgH 已重扫并核对 SII 镜像。".into());
         }
-    } else {
+    } else if backend == Backend::Soem {
         let mut eeprom = SoemEeprom::open(target, position)?;
         let mut original = eeprom.used_image()?;
         let image = build(&xml, &original)?;
@@ -541,24 +555,79 @@ pub(super) fn run(
         let changed: Vec<_> = (CATEGORY_START..image.len())
             .filter(|&i| image[i] != original[i])
             .collect();
-        println!("{} changed SII words, backup {}", changed.len(), backup);
+        progress(format!("{} 字发生变化，备份 {}", changed.len(), backup));
         if write {
             for (n, &index) in changed.iter().rev().enumerate() {
                 let value = eeprom.word(index, Some((original[index], image[index])))?;
                 if value != image[index] {
                     return Err(format!("SII verification mismatch at word 0x{index:04x}."));
                 }
-                println!("Verified {}/{} words", n + 1, changed.len());
+                if (n + 1) % 16 == 0 || n + 1 == changed.len() {
+                    progress(format!("已写入并校验 {}/{} 字", n + 1, changed.len()));
+                }
             }
         }
         eeprom.wire.finish()?;
+    } else {
+        return Err("EEPROM service requires a physical backend.".into());
     }
     Ok(())
+}
+
+pub fn demo_update(current: &mut Vec<u16>, write: bool) -> Result<usize> {
+    let xml = parse_xml(
+        br#"<EtherCATInfo><Vendor><Id>#x24121</Id></Vendor>
+      <Descriptions><Devices><Device><Type ProductCode="1" RevisionNo="1"/>
+      <TxPdo Sm="3"><Index>#x1a00</Index><Entry><Index>#x6000</Index>
+      <SubIndex>0</SubIndex><BitLen>32</BitLen><DataType>UDINT</DataType></Entry></TxPdo>
+      </Device></Devices></Descriptions></EtherCATInfo>"#,
+    )?;
+    if current.is_empty() {
+        let mut baseline = vec![0; CATEGORY_START];
+        baseline[8] = 0x4121;
+        baseline[9] = 2;
+        baseline[10] = 1;
+        baseline[12] = 1;
+        baseline[0x3e] = 1;
+        append_category(
+            &mut baseline,
+            41,
+            &[
+                0, 0, 0, 0x100, 0, 0, 0, 0x200, 0, 0, 0, 0x300, 0, 4, 0, 0x400,
+            ],
+        )?;
+        baseline.push(0xffff);
+        *current = baseline;
+    }
+    let planned = build(&xml, current)?;
+    let changed = planned
+        .iter()
+        .enumerate()
+        .filter(|(index, value)| current.get(*index) != Some(value))
+        .count();
+    if write {
+        *current = planned;
+        categories(current)?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_esi_preview_updates_only_after_mock_write() {
+        let mut sii = Vec::new();
+        let changed = demo_update(&mut sii, false).unwrap();
+        assert!(changed > 0);
+        let before = sii.clone();
+        assert_eq!(demo_update(&mut sii, false).unwrap(), changed);
+        assert_eq!(sii, before);
+        assert_eq!(demo_update(&mut sii, true).unwrap(), changed);
+        assert_eq!(sii[..CATEGORY_START], before[..CATEGORY_START]);
+        assert_eq!(demo_update(&mut sii, false).unwrap(), 0);
+    }
 
     #[test]
     fn esi_build_replaces_pdos_and_preserves_identity_and_other_categories() {

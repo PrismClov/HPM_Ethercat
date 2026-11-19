@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod advanced;
 mod pdo;
 mod workbench;
 
@@ -24,6 +25,8 @@ struct Monitor {
     snapshot: Option<Snapshot>,
     error: Option<String>,
     selected_slave: Option<u32>,
+    show_advanced: bool,
+    advanced: advanced::Advanced,
 }
 
 impl Default for Monitor {
@@ -41,6 +44,8 @@ impl Default for Monitor {
             snapshot: None,
             error: None,
             selected_slave: None,
+            show_advanced: true,
+            advanced: advanced::Advanced::default(),
         }
     }
 }
@@ -305,7 +310,11 @@ fn main() -> eframe::Result {
             creation.egui_ctx.set_theme(egui::Theme::Dark);
             workbench::configure_theme(&creation.egui_ctx);
             configure_font(&creation.egui_ctx);
-            Ok(Box::new(Monitor::default()))
+            let mut monitor = Monitor::default();
+            if std::env::args().any(|argument| argument == "--demo") {
+                monitor.advanced.demo(&creation.egui_ctx);
+            }
+            Ok(Box::new(monitor))
         }),
     )
 }
