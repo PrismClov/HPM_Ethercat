@@ -103,6 +103,26 @@ struct Image {
     wkc: i32,
     expected: i32,
     dc_time_ns: Option<i64>,
+    al: std::sync::Arc<Vec<Al>>,
+    drop_demo_wkc: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Al {
+    pub station: u32,
+    pub state: Option<u16>,
+    pub code: Option<u16>,
+}
+
+pub struct Cycle<'a> {
+    pub id: u64,
+    pub time: Duration,
+    pub jitter_us: Option<f64>,
+    pub values: &'a [Option<u64>],
+    pub valid: bool,
+    pub wkc: i32,
+    pub expected: i32,
+    pub al: &'a std::sync::Arc<Vec<Al>>,
 }
 
 fn parse<T: std::str::FromStr>(value: &str) -> Result<T> {
@@ -141,10 +161,22 @@ impl Image {
             wkc: 6,
             expected: 6,
             dc_time_ns: None,
+            al: std::sync::Arc::new(
+                (0..2)
+                    .map(|station| Al {
+                        station,
+                        state: Some(8),
+                        code: Some(0),
+                    })
+                    .collect(),
+            ),
+            drop_demo_wkc: false,
         }
     }
 
     fn simulate(&mut self, command: &str) -> Result<()> {
+        self.valid = !std::mem::take(&mut self.drop_demo_wkc);
+        self.wkc = if self.valid { 6 } else { 0 };
         let fields: Vec<_> = command.split_whitespace().collect();
         if let ["W", id, value] = fields.as_slice() {
             let id = parse::<usize>(id)?;
@@ -209,6 +241,8 @@ impl Image {
             wkc: 0,
             expected: -1,
             dc_time_ns: None,
+            al: Default::default(),
+            drop_demo_wkc: false,
         })
     }
 
@@ -220,6 +254,7 @@ impl Image {
         self.valid = false;
         self.values.fill(None);
         self.dc_time_ns = None;
+        let mut al = Vec::new();
         wire.response(|row| {
             match row {
                 ["cycle", valid, wkc, expected] => {
@@ -235,10 +270,19 @@ impl Image {
                     *slot = Some(parse(value)?);
                 }
                 ["dc", ns] => self.dc_time_ns = Some(parse(ns)?),
+                ["al", station, state, code] => al.push(Al {
+                    station: parse(station)?,
+                    state: u16::try_from(parse::<i32>(state)?).ok(),
+                    code: u16::try_from(parse::<i32>(code)?).ok(),
+                }),
                 _ => return Err("Unexpected PDO cycle record.".into()),
             }
             Ok(())
-        })
+        })?;
+        if !al.is_empty() && *self.al != al {
+            self.al = std::sync::Arc::new(al);
+        }
+        Ok(())
     }
 
     fn lookup(&self, station: u32, index: u16, output: bool, width: u8) -> Result<usize> {
@@ -439,6 +483,7 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
             Event::Rejected(text) => eprintln!("{text}"),
             Event::Sample { .. } => {}
         },
+        |_| {},
     )
 }
 
@@ -447,6 +492,7 @@ pub fn serve(
     rx: mpsc::Receiver<String>,
     stop: impl Fn() -> bool,
     mut notify: impl FnMut(Event),
+    mut record: impl FnMut(Cycle<'_>),
 ) -> Result<()> {
     let Options {
         backend,
@@ -478,6 +524,9 @@ pub fn serve(
     let mut dc_integral = 0;
     let mut ready = false;
     let mut publish_at = due;
+    let started = due;
+    let mut previous = None;
+    let mut cycle_id = 0;
     loop {
         while Instant::now() < due {
             let remaining = due.saturating_duration_since(Instant::now());
@@ -522,6 +571,21 @@ pub fn serve(
             status_at = now + Duration::from_millis(250);
         }
         image.cycle(write.as_deref().unwrap_or(if check { "S" } else { "P" }))?;
+        let captured = Instant::now();
+        cycle_id += 1;
+        let jitter_us = previous.replace(captured).map(|previous| {
+            captured.duration_since(previous).as_secs_f64() * 1_000_000.0 - f64::from(us)
+        });
+        record(Cycle {
+            id: cycle_id,
+            time: captured.duration_since(started),
+            jitter_us,
+            values: if image.valid { &image.values } else { &[] },
+            valid: image.valid,
+            wkc: image.wkc,
+            expected: image.expected,
+            al: &image.al,
+        });
         if write.is_some() && !image.valid {
             return Err("Output cycle did not receive valid PDO acknowledgement.".into());
         }
@@ -534,7 +598,11 @@ pub fn serve(
         if now >= publish_at || write.is_some() || ready != image.valid {
             publish_at = now + Duration::from_millis(40);
             notify(Event::Sample {
-                values: image.values.clone(),
+                values: if image.valid {
+                    image.values.clone()
+                } else {
+                    vec![None; image.entries.len()]
+                },
                 valid: image.valid,
                 wkc: image.wkc,
                 expected: image.expected,
@@ -583,6 +651,7 @@ fn execute(
             job.take();
             image.values[3] = Some(8);
         }
+        ["demo", "wkc"] if image.wire.is_none() => image.drop_demo_wkc = true,
         ["read", key] => {
             let value = image.values.get(id(key)?).ok_or("Unknown variable ID.")?;
             notify(Event::Notice(format!(

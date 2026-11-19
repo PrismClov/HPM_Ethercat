@@ -7,6 +7,7 @@ use ethercat_monitor::{
     },
 };
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
@@ -16,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+use crate::trace::{Display, History, Key, Recorded, Source, Watch};
 use crate::{al_state, FAULT, GOOD, WARN};
 
 #[derive(Default)]
@@ -32,6 +34,7 @@ struct Updates {
     sample: Option<Sample>,
     notice: Option<(String, bool)>,
     finished: Option<bool>,
+    frames: VecDeque<Recorded>,
 }
 
 struct Worker {
@@ -79,6 +82,17 @@ impl Worker {
                     }
                     ctx.request_repaint();
                 },
+                |cycle| {
+                    let limit = (8 * 1024 * 1024
+                        / (size_of::<Recorded>() + cycle.values.len() * size_of::<Option<u64>>()))
+                    .clamp(16, 4096);
+                    let frame = Recorded::from(cycle);
+                    let mut updates = worker_updates.lock().unwrap();
+                    while updates.frames.len() >= limit {
+                        updates.frames.pop_front();
+                    }
+                    updates.frames.push_back(frame);
+                },
             );
             let mut updates = worker_updates.lock().unwrap();
             updates.finished = Some(result.is_ok());
@@ -117,19 +131,19 @@ impl Drop for Worker {
 type EsiStatus = (String, bool, bool);
 
 pub(super) struct Advanced {
-    backend: Backend,
+    pub(super) backend: Backend,
     adapters: crate::adapter_picker::AdapterPicker,
-    target: String,
+    pub(super) target: String,
     confirmed: bool,
     writes: bool,
-    cycle_us: u32,
-    dc: bool,
-    activation: String,
+    pub(super) cycle_us: u32,
+    pub(super) dc: bool,
+    pub(super) activation: String,
     scan: Option<Session>,
     scan_stopping: bool,
     next_start: Option<Options>,
     slaves: Vec<Slave>,
-    selected: Option<u32>,
+    pub(super) selected: Option<u32>,
     worker: Option<Worker>,
     entries: Vec<Entry>,
     sample: Sample,
@@ -143,6 +157,8 @@ pub(super) struct Advanced {
     ask_burn: bool,
     esi_job: Option<(JoinHandle<()>, Arc<Mutex<EsiStatus>>)>,
     demo_sii: Vec<u16>,
+    pub(super) history: History,
+    pub(super) watches: Vec<Watch>,
 }
 
 impl Default for Advanced {
@@ -174,6 +190,8 @@ impl Default for Advanced {
             ask_burn: false,
             esi_job: None,
             demo_sii: Vec::new(),
+            history: History::default(),
+            watches: Vec::new(),
         }
     }
 }
@@ -200,8 +218,10 @@ impl Advanced {
     }
 
     pub(super) fn demo(&mut self, ctx: &egui::Context) {
+        self.backend = Backend::Demo;
+        self.dc = false;
         self.demo_scan();
-        self.selected = Some(1);
+        self.selected = Some(0);
         self.start(
             Options {
                 backend: Backend::Demo,
@@ -233,6 +253,10 @@ impl Advanced {
     }
 
     fn start(&mut self, options: Options, ctx: &egui::Context) {
+        self.history = History::default();
+        for watch in &mut self.watches {
+            watch.id = None;
+        }
         self.entries.clear();
         self.sample = Sample::default();
         self.write_id = None;
@@ -280,9 +304,14 @@ impl Advanced {
             }
         }
         if let Some(worker) = &self.worker {
+            let mut frames;
             let finished = {
                 let mut updates = worker.updates.lock().unwrap();
                 if let Some(entries) = updates.entries.take() {
+                    self.history.layout(&entries);
+                    for watch in &mut self.watches {
+                        watch.id = watch.key.bind(&entries);
+                    }
                     self.entries = entries;
                 }
                 if let Some(sample) = updates.sample.take() {
@@ -291,8 +320,12 @@ impl Advanced {
                 if let Some(notice) = updates.notice.take() {
                     self.notice = Some(notice);
                 }
+                frames = std::mem::take(&mut updates.frames);
                 updates.finished
             };
+            while let Some(frame) = frames.pop_front() {
+                self.history.push(frame);
+            }
             if let Some(clean) = finished {
                 self.worker = None;
                 self.sample = Sample::default();
@@ -325,7 +358,8 @@ impl Advanced {
     }
 
     fn writable(&self) -> bool {
-        self.sample.valid
+        self.history.cursor.is_none()
+            && self.sample.valid
             && self
                 .worker
                 .as_ref()
@@ -364,6 +398,10 @@ impl Advanced {
                     self.selected = None;
                     self.write_id = None;
                     self.notice = None;
+                    self.history = History::default();
+                    for watch in &mut self.watches {
+                        watch.id = None;
+                    }
                 }
                 let changed = match self.backend {
                     Backend::Igh => {
@@ -380,6 +418,10 @@ impl Advanced {
                     self.selected = None;
                     self.entries.clear();
                     self.write_id = None;
+                    self.history = History::default();
+                    for watch in &mut self.watches {
+                        watch.id = None;
+                    }
                 }
             });
             ui.add_enabled_ui(
@@ -629,12 +671,26 @@ impl Advanced {
             ui.weak("先扫描总线，再选择从站。");
             return;
         };
-        ui.heading("在线 PDO");
+        ui.horizontal(|ui| {
+            ui.heading("在线 PDO");
+            ui.weak("右键 PDO 行加入观察或波形");
+            if self.backend == Backend::Demo
+                && self.worker.is_some()
+                && ui.button("模拟 WKC 归零").clicked()
+            {
+                self.send("demo wkc".into());
+            }
+        });
         if self.entries.is_empty() {
             ui.weak("启动 PDO 后显示从站的 RxPDO 和 TxPDO。");
             return;
         }
         let writable = self.writable();
+        let hpm = self
+            .slaves
+            .iter()
+            .any(|s| s.position == station && (s.vendor, s.product) == (0x00024121, 1));
+        let mut add = None;
         egui::Grid::new("generic_pdos")
             .striped(true)
             .spacing(egui::vec2(17.0, 6.0))
@@ -649,23 +705,53 @@ impl Advanced {
                     .enumerate()
                     .filter(|(_, e)| e.station == station)
                 {
-                    ui.label(if entry.output {
-                        "Rx · 输出"
-                    } else {
-                        "Tx · 输入"
-                    });
-                    ui.monospace(format!("0x{:04X}", entry.pdo));
-                    ui.monospace(format!("0x{:04X}:{:02X}", entry.index, entry.sub));
-                    ui.monospace(entry.width.to_string());
-                    ui.monospace(entry.offset.to_string());
-                    ui.monospace(
+                    let cells = [
+                        if entry.output {
+                            "Rx · 输出".into()
+                        } else {
+                            "Tx · 输入".into()
+                        },
+                        format!("0x{:04X}", entry.pdo),
+                        format!("0x{:04X}:{:02X}", entry.index, entry.sub),
+                        entry.width.to_string(),
+                        entry.offset.to_string(),
                         self.sample
                             .values
                             .get(id)
                             .copied()
                             .flatten()
                             .map_or("—".into(), |v| format!("0x{v:X}")),
-                    );
+                    ];
+                    let mut responses = cells.into_iter().map(|cell| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(cell).monospace())
+                                .sense(egui::Sense::click()),
+                        )
+                    });
+                    let row = responses.next().unwrap();
+                    let row = responses.fold(row, |left, right| left.union(right));
+                    if entry.width <= 64 {
+                        row.context_menu(|ui| {
+                            for (label, source, plot) in [
+                                ("加入观察", Source::Pdo, false),
+                                ("加入波形", Source::Pdo, true),
+                                ("GPIO 加入波形", Source::Gpio, true),
+                                ("PDI 相位加入波形", Source::Pdi, true),
+                            ] {
+                                if source != Source::Pdo
+                                    && !(hpm
+                                        && !entry.output
+                                        && (entry.index, entry.sub, entry.width) == (0x6000, 0, 32))
+                                {
+                                    continue;
+                                }
+                                if ui.button(label).clicked() {
+                                    add = Some((Key::entry(entry, source), Some(id), plot));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
                     if entry.output && entry.width <= 64 {
                         if ui
                             .add_enabled(
@@ -690,6 +776,9 @@ impl Advanced {
                     ui.end_row();
                 }
             });
+        if let Some((key, id, plotted)) = add {
+            self.add_watch(key, id, plotted);
+        }
         if let Some(id) = self.write_id {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -705,6 +794,27 @@ impl Advanced {
             });
         }
         self.drive_panel(ui, station, writable);
+    }
+
+    pub(super) fn add_watch(&mut self, key: Key, id: Option<usize>, plotted: bool) {
+        if let Some(watch) = self.watches.iter_mut().find(|watch| watch.key == key) {
+            watch.plotted |= plotted;
+            watch.id = id;
+        } else if self.watches.len() < 256 {
+            let display = if matches!(key.source, Source::Wkc | Source::Pdi) {
+                Display::Decimal
+            } else {
+                Display::Hex
+            };
+            self.watches.push(Watch {
+                key,
+                id,
+                plotted,
+                display,
+                group: "默认".into(),
+                color: self.watches.len() % 8,
+            });
+        }
     }
 
     fn drive_panel(&mut self, ui: &mut egui::Ui, station: u32, writable: bool) {
@@ -794,6 +904,16 @@ impl Advanced {
                     }
                 });
             });
+    }
+
+    pub(super) fn fault_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(id, e)| {
+                (!e.output && e.index == 0x6041 && e.sub == 0 && e.width == 16).then_some(id)
+            })
+            .collect()
     }
 
     fn esi_panel(&mut self, ui: &mut egui::Ui) {
@@ -926,5 +1046,80 @@ fn drive_label(state: DriveState) -> &'static str {
         DriveState::Reaction => "故障反应",
         DriveState::Fault => "故障",
         DriveState::Unknown => "未知",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event as Input, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+    fn location(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn right_click_pdo_then_add_waveform_in_two_actions() {
+        let ctx = egui::Context::default();
+        let mut app = Advanced::default();
+        app.demo_scan();
+        app.entries.push(Entry {
+            station: 0,
+            pdo: 0x1a00,
+            index: 0x6000,
+            sub: 0,
+            width: 32,
+            offset: 0,
+            output: false,
+        });
+        let draw = |app: &mut Advanced, events| {
+            ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                    events,
+                    ..RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.process_panel(ui));
+                },
+            )
+        };
+        let click = |app: &mut Advanced, pos, button| {
+            draw(
+                app,
+                vec![
+                    Input::PointerMoved(pos),
+                    Input::PointerButton {
+                        pos,
+                        button,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            draw(
+                app,
+                vec![Input::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            )
+        };
+        let row = location(&draw(&mut app, vec![]), "0x6000:00").unwrap();
+        let output = click(&mut app, row, PointerButton::Secondary);
+        let menu = location(&output, "加入波形")
+            .or_else(|| location(&draw(&mut app, vec![]), "加入波形"))
+            .expect("secondary click should open the PDO menu");
+        click(&mut app, menu, PointerButton::Primary);
+        assert_eq!(app.watches.len(), 1);
+        assert_eq!(app.watches[0].key.index, 0x6000);
+        assert!(app.watches[0].plotted);
     }
 }

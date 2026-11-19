@@ -97,6 +97,13 @@ static int igh_process(ec_master_t *master, uint32_t period_ns, unsigned assign)
             ec_master_state_t bus = {0};
             ecrt_master_state(master, &bus);
             topology_ok = bus.slaves_responding == count && bus.link_up;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                ec_slave_info_t slave = {0};
+                int al = ecrt_master_get_slave(master, (uint16_t)i, &slave) == 0 && topology_ok
+                    ? slave.al_state | (slave.error_flag ? 0x10 : 0) : -1;
+                printf("ecat\tal\t%u\t%d\t-1\n", i, al);
+            }
         }
         int valid = topology_ok && state.wc_state == EC_WC_COMPLETE;
         for (unsigned i = 0; valid && i < count; ++i)

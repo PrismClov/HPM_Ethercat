@@ -183,11 +183,12 @@ static int soem_process(ecx_contextt *ctx, int count, uint32_t period_ns, unsign
         if (req == 'S' || !image->valid)
         {
             operational = bus_count(ctx) == count;
-            for (int i = 1; operational && i <= count; ++i)
+            for (int i = 1; i <= count; ++i)
             {
                 int state, code;
                 read_al(ctx, &ctx->slavelist[i], &state, &code);
-                operational = state == EC_STATE_OPERATIONAL && !code;
+                printf("ecat\tal\t%d\t%d\t%d\n", i - 1, state, code);
+                operational = operational && state == EC_STATE_OPERATIONAL && !code;
             }
         }
         if (assign && operational && wkc == expected)

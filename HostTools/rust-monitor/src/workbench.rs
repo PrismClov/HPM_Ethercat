@@ -1,7 +1,7 @@
+use crate::{advanced::Advanced, trace::Watch, trace_view, GOOD};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke};
-use ethercat_monitor::backend::{Backend, Slave};
-
-use crate::{al_state, Monitor, FAULT, GOOD, WARN};
+use ethercat_monitor::backend::Backend;
+use std::{env, fs, path::PathBuf};
 
 const CANVAS: Color32 = Color32::from_rgb(13, 20, 29);
 const SURFACE: Color32 = Color32::from_rgb(21, 31, 43);
@@ -36,256 +36,192 @@ pub(crate) fn configure_theme(ctx: &egui::Context) {
     });
 }
 
-impl Monitor {
-    pub(super) fn workbench(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("connection")
-            .frame(
-                Frame::new()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(Margin::symmetric(20, 12)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading(RichText::new("EtherCAT 工作台").size(23.0).strong());
-                    ui.add_space(10.0);
-                    ui.add_enabled_ui(self.session.is_none() && !self.advanced.busy(), |ui| {
-                        ui.selectable_value(&mut self.show_advanced, true, "通用调试");
-                        ui.selectable_value(&mut self.show_advanced, false, "HPM 实时波形");
-                    });
-                });
-                ui.add_space(3.0);
-                if self.show_advanced {
-                    self.advanced.controls(ui);
-                } else {
-                    self.controls(ui);
-                }
-            });
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Profile {
+    backend: String,
+    target: String,
+    cycle_us: u32,
+    dc: bool,
+    activation: String,
+    watches: Vec<Watch>,
+    left: f32,
+    right: f32,
+    bottom: f32,
+}
 
-        egui::TopBottomPanel::bottom("bus_status")
-            .frame(
-                Frame::new()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(Margin::symmetric(20, 6)),
-            )
-            .show(ctx, |ui| {
-                if self.show_advanced {
-                    self.advanced.status(ui);
-                } else {
-                    self.overview(ui);
-                }
-            });
-
-        egui::SidePanel::left("slave_inspector")
-            .default_width(310.0)
-            .width_range(270.0..=440.0)
-            .frame(
-                Frame::new()
-                    .fill(SURFACE)
-                    .inner_margin(Margin::symmetric(16, 15)),
-            )
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("inspector")
-                    .show(ui, |ui| {
-                        if self.show_advanced {
-                            self.advanced.sidebar(ui);
-                        } else {
-                            self.inspector(ui);
-                        }
-                    });
-            });
-
-        egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(CANVAS)
-                    .inner_margin(Margin::symmetric(20, 15)),
-            )
-            .show(ctx, |ui| {
-                if self.show_advanced {
-                    self.advanced.central(ui);
-                    return;
-                }
-                ui.heading(if self.pdo_enabled {
-                    "实时波形"
-                } else {
-                    "总线监视"
-                });
-                ui.add_space(6.0);
-                if self.pdo_enabled {
-                    egui::ScrollArea::vertical()
-                        .id_salt("waveforms")
-                        .show(ui, |ui| {
-                            Frame::new()
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
-                                .corner_radius(8)
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    self.pdo_view
-                                        .show(ui, self.session.is_some() && !self.stopping);
-                                });
-                        });
-                } else {
-                    self.scan_results(ui);
-                }
-            });
-    }
-
-    fn scan_results(&self, ui: &mut egui::Ui) {
-        let Some(snapshot) = &self.snapshot else {
-            ui.weak("连接主站后显示扫描结果");
-            return;
-        };
-        if snapshot.slaves.is_empty() {
-            ui.weak("当前没有从站");
-            return;
-        }
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("scan_results")
-                .striped(true)
-                .spacing(egui::vec2(16.0, 8.0))
-                .show(ui, |ui| {
-                    for label in [
-                        "位置",
-                        "从站",
-                        "厂商 ID",
-                        "产品代码",
-                        "修订号",
-                        "AL 状态",
-                        "AL 状态码",
-                    ] {
-                        ui.strong(label);
-                    }
-                    ui.end_row();
-                    for slave in &snapshot.slaves {
-                        let (state, color) = al_state(slave.state);
-                        ui.monospace(slave.position.to_string());
-                        ui.label(slave_name(slave));
-                        ui.monospace(format!("0x{:08X}", slave.vendor));
-                        ui.monospace(format!("0x{:08X}", slave.product));
-                        ui.monospace(format!("0x{:08X}", slave.revision));
-                        ui.colored_label(color, state);
-                        ui.monospace(
-                            slave
-                                .al_code
-                                .map_or("—".into(), |code| format!("0x{code:04X}")),
-                        );
-                        ui.end_row();
-                    }
-                });
-        });
-    }
-
-    fn inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading("从站");
-        let Some(snapshot) = &self.snapshot else {
-            ui.weak("连接主站后显示从站");
-            return;
-        };
-        if snapshot.slaves.is_empty() {
-            ui.weak("当前没有从站");
-            self.selected_slave = None;
-            return;
-        }
-        if !snapshot
-            .slaves
-            .iter()
-            .any(|slave| Some(slave.position) == self.selected_slave)
-        {
-            self.selected_slave = snapshot.slaves.first().map(|slave| slave.position);
-        }
-        for slave in &snapshot.slaves {
-            ui.horizontal(|ui| {
-                let (state, color) = al_state(slave.state);
-                let name = format!("{:02}  {}", slave.position, slave_name(slave));
-                let label = egui::Button::new(name)
-                    .selected(self.selected_slave == Some(slave.position))
-                    .truncate();
-                if ui
-                    .add_sized([ui.available_width() - 85.0, 30.0], label)
-                    .on_hover_text(slave_name(slave))
-                    .clicked()
-                {
-                    self.selected_slave = Some(slave.position);
-                }
-                ui.colored_label(color, state);
-            });
-        }
-
-        let Some(slave) = snapshot
-            .slaves
-            .iter()
-            .find(|slave| Some(slave.position) == self.selected_slave)
-        else {
-            return;
-        };
-        ui.add_space(8.0);
-        ui.separator();
-        ui.collapsing("从站信息", |ui| slave_details(ui, slave));
-
-        let is_hpm = (slave.vendor, slave.product) == (0x0002_4121, 1)
-            || (self.backend == Backend::Demo && slave.position == 0);
-        if self.pdo_enabled && is_hpm {
-            ui.separator();
-            egui::CollapsingHeader::new("过程变量")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.monospace("TxPDO  0x6000:00  UINT32");
-                    self.pdo_view.variables(ui);
-                    ui.add_space(5.0);
-                    ui.monospace("RxPDO  0x7010:00  UINT32");
-                    ui.weak(if snapshot.pdo.is_some() {
-                        "固定零值输出"
-                    } else {
-                        "等待 PDO 数据"
-                    });
-                });
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            backend: "demo".into(),
+            target: String::new(),
+            cycle_us: 5000,
+            dc: false,
+            activation: "0x0300".into(),
+            watches: Vec::new(),
+            left: 0.19,
+            right: 0.22,
+            bottom: 0.40,
         }
     }
 }
 
-fn slave_name(slave: &Slave) -> &str {
-    if slave.name.is_empty() {
-        "未命名从站"
+fn profile_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env::var_os("APPDATA").map(PathBuf::from)
     } else {
-        &slave.name
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
+    .map(|dir| dir.join("ethercat-monitor").join("workbench-v1.json"))
+}
+
+pub struct Workbench {
+    app: Advanced,
+    timeline: trace_view::Timeline,
+    path: Option<PathBuf>,
+    panels: [bool; 3],
+    proportions: [f32; 3],
+}
+
+impl Workbench {
+    pub fn new(ctx: &egui::Context, demo: bool) -> Self {
+        let path = if demo { None } else { profile_path() };
+        let profile: Profile = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default();
+        let mut app = Advanced::default();
+        app.backend = match profile.backend.as_str() {
+            "soem" => Backend::Soem,
+            "igh" if cfg!(target_os = "linux") => Backend::Igh,
+            _ => Backend::Demo,
+        };
+        app.target = profile.target;
+        app.cycle_us = profile.cycle_us.clamp(100, 20_000);
+        app.dc = profile.dc;
+        app.activation = profile.activation;
+        app.watches = profile.watches.into_iter().take(256).collect();
+        if demo {
+            app.demo(ctx);
+        }
+        Self {
+            app,
+            timeline: trace_view::Timeline::default(),
+            path,
+            panels: [true; 3],
+            proportions: [
+                profile.left.clamp(0.12, 0.33),
+                profile.right.clamp(0.15, 0.36),
+                profile.bottom.clamp(0.20, 0.65),
+            ],
+        }
+    }
+
+    fn save_profile(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let profile = Profile {
+            backend: match self.app.backend {
+                Backend::Igh => "igh",
+                Backend::Soem => "soem",
+                Backend::Demo => "demo",
+            }
+            .into(),
+            target: self.app.target.clone(),
+            cycle_us: self.app.cycle_us,
+            dc: self.app.dc,
+            activation: self.app.activation.clone(),
+            watches: self.app.watches.clone(),
+            left: self.proportions[0],
+            right: self.proportions[1],
+            bottom: self.proportions[2],
+        };
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        fs::create_dir_all(parent)?;
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        fs::write(&temp, serde_json::to_vec_pretty(&profile)?)?;
+        fs::rename(temp, path)
     }
 }
 
-fn slave_details(ui: &mut egui::Ui, slave: &Slave) {
-    let (state, color) = al_state(slave.state);
-    egui::Grid::new("slave_metadata")
-        .striped(true)
-        .show(ui, |ui| {
-            for (label, value) in [
-                ("位置", slave.position.to_string()),
-                ("厂商 ID", format!("0x{:08X}", slave.vendor)),
-                ("产品代码", format!("0x{:08X}", slave.product)),
-                ("修订号", format!("0x{:08X}", slave.revision)),
-            ] {
-                ui.weak(label);
-                ui.monospace(value);
-                ui.end_row();
-            }
-            ui.weak("AL 状态");
-            ui.colored_label(color, state);
-            ui.end_row();
-            ui.weak("AL 状态码");
-            let color = match slave.al_code {
-                Some(0) => GOOD,
-                Some(_) => FAULT,
-                None => WARN,
-            };
-            ui.colored_label(
-                color,
-                slave
-                    .al_code
-                    .map_or("—".into(), |code| format!("0x{code:04X}")),
-            );
-            ui.end_row();
-        });
+impl eframe::App for Workbench {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        let size = ctx.screen_rect().size();
+        let surface = |x, y| {
+            Frame::new()
+                .fill(SURFACE)
+                .inner_margin(Margin::symmetric(x, y))
+        };
+        egui::TopBottomPanel::top("toolbar")
+            .frame(surface(12, 6))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(RichText::new("EtherCAT 工作台").size(18.0).strong());
+                    ui.separator();
+                    for (open, label) in self.panels.iter_mut().zip(["从站树", "观察", "时间轴"])
+                    {
+                        if ui.selectable_label(*open, label).clicked() {
+                            *open = !*open;
+                        }
+                    }
+                });
+                self.app.controls(ui);
+            });
+        egui::TopBottomPanel::bottom("bus_status")
+            .frame(surface(12, 4))
+            .show(ctx, |ui| {
+                self.app.status(ui);
+            });
+        if self.panels[2] {
+            let response = egui::TopBottomPanel::bottom("trace")
+                .resizable(true)
+                .height_range(155.0..=(size.y * 0.65).max(155.0))
+                .default_height(size.y * self.proportions[2])
+                .frame(surface(10, 4))
+                .show(ctx, |ui| self.timeline.show(&mut self.app, ui));
+            self.proportions[2] =
+                (response.response.rect.height() / size.y.max(1.0)).clamp(0.20, 0.65);
+        }
+        if self.panels[0] {
+            let shown = egui::SidePanel::left("topology")
+                .resizable(true)
+                .default_width(size.x * self.proportions[0])
+                .width_range(143.0..=(size.x * 0.33).max(143.0))
+                .frame(surface(10, 8))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("topology_rows")
+                        .show(ui, |ui| self.app.sidebar(ui));
+                });
+            self.proportions[0] = (shown.response.rect.width() / size.x.max(1.0)).clamp(0.12, 0.33);
+        }
+        if self.panels[1] {
+            let shown = egui::SidePanel::right("watch")
+                .resizable(true)
+                .default_width(size.x * self.proportions[1])
+                .width_range(190.0..=(size.x * 0.36).max(190.0))
+                .frame(surface(10, 8))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("watch_rows")
+                        .show(ui, |ui| trace_view::observations(&mut self.app, ui));
+                });
+            self.proportions[1] = (shown.response.rect.width() / size.x.max(1.0)).clamp(0.15, 0.36);
+        }
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(12)))
+            .show(ctx, |ui| self.app.central(ui));
+    }
+
+    fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        if let Err(error) = self.save_profile() {
+            eprintln!("无法保存工作台设置：{error}");
+        }
+    }
 }
