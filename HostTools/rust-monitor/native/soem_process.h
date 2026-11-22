@@ -109,9 +109,9 @@ static int soem_map_direction(ecx_contextt *ctx, process_image *image, unsigned 
 static int soem_process(ecx_contextt *ctx, int count, uint32_t period_ns, unsigned assign)
 {
     int result = 1;
-    if (count <= 0 || (assign && (assign != 0x0300 || count != 1)))
+    if (count <= 0 || (assign && assign != 0x0300))
     {
-        pdo_error("SOEM DC mode requires a single slave with AssignActivate 0x0300 (SYNC0).");
+        pdo_error("SOEM needs responding slaves and supports AssignActivate 0x0300 for SYNC0.");
         return 1;
     }
     process_image *image = calloc(1, sizeof(*image));
@@ -157,8 +157,13 @@ static int soem_process(ecx_contextt *ctx, int count, uint32_t period_ns, unsign
             goto stop;
         }
         for (int i = 1; i <= count; ++i)
-            if (ctx->slavelist[i].hasdc)
-                ecx_dcsync0(ctx, (uint16_t)i, TRUE, period_ns, 0);
+            if (!ctx->slavelist[i].hasdc)
+            {
+                pdo_error("A slave in the requested DC group lacks a distributed clock.");
+                goto stop;
+            }
+        for (int i = 1; i <= count; ++i)
+            ecx_dcsync0(ctx, (uint16_t)i, TRUE, period_ns, 0);
     }
     ctx->slavelist[0].state = EC_STATE_SAFE_OP;
     if (ecx_writestate(ctx, 0) <= 0 ||
@@ -167,8 +172,23 @@ static int soem_process(ecx_contextt *ctx, int count, uint32_t period_ns, unsign
         pdo_error("SOEM slaves did not enter SAFE-OP.");
         goto stop;
     }
-    ecx_send_processdata(ctx);
-    ecx_receive_processdata(ctx, EC_TIMEOUTRET);
+    /* SOEM schedules the first SYNC0 at least 100 ms in the future.
+     * Keep zero PDOs circulating in SAFE-OP while both clocks start. */
+    uint64_t next = monotonic_ns();
+    uint64_t ready = next + (assign ? UINT64_C(100000000) + 2u * period_ns : 0);
+    do
+    {
+        ecx_send_processdata(ctx);
+        ecx_receive_processdata(ctx, EC_TIMEOUTRET);
+        if (!assign)
+            break;
+        next += period_ns;
+        uint64_t now = monotonic_ns();
+        if (next > now)
+            osal_usleep((uint32_t)((next - now) / 1000));
+        else
+            next = now;
+    } while (next < ready);
     ctx->slavelist[0].state = EC_STATE_OPERATIONAL;
     ecx_writestate(ctx, 0);
     if (!image_layout(image))
@@ -176,10 +196,13 @@ static int soem_process(ecx_contextt *ctx, int count, uint32_t period_ns, unsign
         pdo_error("SOEM PDO layout has no valid entries.");
         goto stop;
     }
+    int timeout_us = (int)(period_ns / 1000u);
+    if (timeout_us > EC_TIMEOUTRET)
+        timeout_us = EC_TIMEOUTRET;
     int operational = 0;
     for (int req; (req = image_next(image)) != 0;)
     {
-        int wkc = ecx_send_processdata(ctx) > 0 ? ecx_receive_processdata(ctx, EC_TIMEOUTRET) : 0;
+        int wkc = ecx_send_processdata(ctx) > 0 ? ecx_receive_processdata(ctx, timeout_us) : EC_NOFRAME;
         if (req == 'S' || !image->valid)
         {
             operational = bus_count(ctx) == count;

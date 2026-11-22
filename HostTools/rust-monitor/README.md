@@ -30,7 +30,7 @@ cargo build --release --locked --no-default-features --bin ethercat-service
 
 - `process` 列出 PDO 和条目的方向、对象索引、位宽与实际位偏移。`read ID` 读取有效样本，`set ID VALUE` 写入至多 64 位的 RxPDO 原始值。通过 `--allow-outputs` 启用显式写入。过程数据会话请求 OP，初始输出为零。`quit` 关闭会话。
 - SOEM 从在线 CoE 映射读取布局，无 CoE 时从 SII 读取。同一从站每个方向支持一个过程数据 SyncManager，布局须与实际 IOmap 一致。IgH 通过内核主站读取在线映射并按条目位置注册 PDO。
-- `freerun` 使用主机调度。DC 使用 ESI 中的 SYNC0 AssignActivate，目前支持单从站。SOEM 接受 `0x0300`，并用参考时钟调节发送周期。IgH 用应用时间同步参考时钟及从站时钟。模式在新会话启动时配置。
+- `freerun` 使用主机调度。DC 使用 ESI 中的 SYNC0 AssignActivate。SOEM 支持全部从站均具备 DC 的多站总线，接受 `0x0300`，并用参考时钟调节发送周期。IgH 的 DC 模式支持单从站，用应用时间同步参考时钟及从站时钟。模式在新会话启动时配置。
 - CiA402 从映射中匹配控制字 `0x6040:00` 和状态字 `0x6041:00`。`drive 0 status` 显示状态。`drive 0 enable` 按在线状态推进使能序列，`reset` 发送故障复位脉冲，`disable` 禁止电压，`stop` 发送快速停止控制字。映射 `0x6060:00` 时可用 `drive 0 mode 8` 写入模式，映射 `0x6061:00` 时 `status` 显示模式反馈。
 
 ### ESI 更新 EEPROM

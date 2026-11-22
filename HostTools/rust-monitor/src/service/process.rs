@@ -487,6 +487,16 @@ pub(super) fn run(backend: Backend, target: &str, us: u32, dc: u16, writable: bo
     )
 }
 
+fn current_slot_start(due: Instant, now: Instant, period: Duration) -> Instant {
+    let late = now.saturating_duration_since(due);
+    if late < period {
+        return due;
+    }
+    // Skip fully elapsed slots and retain the slot that can still send.
+    let elapsed = late.as_nanos() % period.as_nanos();
+    now - Duration::from_nanos(elapsed as u64)
+}
+
 pub fn serve(
     options: Options,
     rx: mpsc::Receiver<String>,
@@ -519,6 +529,7 @@ pub fn serve(
     notify(Event::Layout(image.entries.clone()));
     let period = Duration::from_micros(u64::from(us));
     let mut due = Instant::now();
+    let mut scheduled_period = period;
     let mut status_at = due;
     let mut job = None::<DriveJob>;
     let mut dc_integral = 0;
@@ -540,6 +551,7 @@ pub fn serve(
             return image.finish();
         }
         let now = Instant::now();
+        due = current_slot_start(due, now, scheduled_period);
         let request = match rx.try_recv() {
             Ok(line) if line.trim() == "quit" => return image.finish(),
             Ok(line) => Some(line),
@@ -622,11 +634,7 @@ pub fn serve(
             period
         };
         due += adjusted_period;
-        let finished = Instant::now();
-        if due <= finished {
-            let late = finished.duration_since(due).as_nanos() % adjusted_period.as_nanos();
-            due = finished + (adjusted_period - Duration::from_nanos(late as u64));
-        }
+        scheduled_period = adjusted_period;
     }
 }
 
@@ -730,6 +738,19 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wakeup_inside_a_slot_preserves_its_remaining_send_budget() {
+        let due = Instant::now();
+        let period = Duration::from_micros(1000);
+        for (late, expected) in [(0, 0), (1, 0), (999, 0), (1000, 1000), (2501, 2000)] {
+            let wakeup = due + Duration::from_micros(late);
+            assert_eq!(
+                current_slot_start(due, wakeup, period),
+                due + Duration::from_micros(expected)
+            );
+        }
+    }
 
     #[test]
     fn simulated_drive_follows_the_shared_cia402_sequence() {
